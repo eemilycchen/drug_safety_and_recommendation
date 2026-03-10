@@ -1,2 +1,7 @@
+#part 1
 psycopg2-binary
 pandas
+
+#part 4
+pymongo>=4.0
+requests>=2.28

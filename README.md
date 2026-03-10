@@ -53,9 +53,9 @@ For details on what each part must implement and the function-level interface co
 Stores **structured EHR-like data** from Synthea: patients, encounters, medications, conditions, labs, etc. This is the source of truth for a patient’s current active medications and overall clinical profile.
 - **Neo4j**  
 Stores a **knowledge graph** of drug–drug interactions and side effects, built from **RxNav** and **SIDER**. Enables graph queries such as “does this proposed drug interact with any of the patient’s current medications?” and “what serious side effects are associated with this drug?”.
-- **Qdrant **  
+- **Qdrant**  
 Stores **vector embeddings** of adverse event reports and/or patient profiles derived from **openFDA FAERS**. Enables similarity search such as “find FAERS cases most similar to this patient on this drug”.
-- **MongoDB **  
+- **MongoDB**  
 Serves as an **evidence store and audit trail**:
   - Raw FAERS JSON documents for traceability
   - Normalized documents used to build Qdrant embeddings
