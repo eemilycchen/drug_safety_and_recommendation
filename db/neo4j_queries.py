@@ -351,9 +351,17 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     current = [m.strip() for m in args.current_meds.split(",") if m.strip()]
+    conn = {"uri": args.uri, "user": args.user, "password": args.password}
 
+    # 1. Graph stats
+    print("\n--- Graph Statistics ---")
+    stats = get_drug_stats(**conn)
+    for k, v in stats.items():
+        print(f"  {k}: {v}")
+
+    # 2. Interactions
     print(f"\n--- Interactions: {current} vs {args.drug} ---")
-    interactions = check_interactions(current, args.drug, args.uri, args.user, args.password)
+    interactions = check_interactions(current, args.drug, **conn)
     if interactions:
         for i in interactions:
             print(f"  {i['current_drug']} <-> {i['proposed_drug']}: "
@@ -365,7 +373,7 @@ if __name__ == "__main__":
     print(f"\n--- Side effects: {args.drug} ---")
     effects = get_side_effects(args.drug, **conn)
     print(f"\n--- Side effects: {args.drug} ---")
-    effects = get_side_effects(args.drug, args.uri, args.user, args.password)
+    effects = get_side_effects(args.drug, **conn)
     if effects:
         for e in effects[:20]:
             print(f"  {e['side_effect']} (freq: {e['frequency']})")
