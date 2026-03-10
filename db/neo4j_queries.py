@@ -348,6 +348,12 @@ if __name__ == "__main__":
     # 2. Interactions
     print(f"\n--- Interactions: {current} vs {args.drug} ---")
     interactions = check_interactions(current, args.drug, **conn)
+    args = parser.parse_args()
+
+    current = [m.strip() for m in args.current_meds.split(",") if m.strip()]
+
+    print(f"\n--- Interactions: {current} vs {args.drug} ---")
+    interactions = check_interactions(current, args.drug, args.uri, args.user, args.password)
     if interactions:
         for i in interactions:
             print(f"  {i['current_drug']} <-> {i['proposed_drug']}: "
@@ -358,6 +364,8 @@ if __name__ == "__main__":
     # 3. Side effects
     print(f"\n--- Side effects: {args.drug} ---")
     effects = get_side_effects(args.drug, **conn)
+    print(f"\n--- Side effects: {args.drug} ---")
+    effects = get_side_effects(args.drug, args.uri, args.user, args.password)
     if effects:
         for e in effects[:20]:
             print(f"  {e['side_effect']} (freq: {e['frequency']})")
