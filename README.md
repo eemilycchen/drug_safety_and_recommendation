@@ -22,17 +22,17 @@ drug_safety_and_recommendation/
     pg_schema.sql            # PostgreSQL DDL for Synthea data 
     pg_queries.py            # get_active_medications(), get_patient_profile(), helpers
     pg_queries.ipynb         # Notebook for exploring pg_queries
-    # neo4j_queries.py       # TODO part 2
+    neo4j_queries.py         # Part 2: check_interactions(), get_side_effects(), etc.
+    mongo_queries.py         # Part 4: get_faers_reports_by_ids(), log_safety_check(), etc.
     # qdrant_queries.py      # TODO part 3
-    # mongo_queries.py       # TODO part 4
   etl/
     __init__.py
     load_synthea_to_pg.py    # Load all Synthea CSVs into PostgreSQL 
     load_synthea_to_pg.ipynb # Notebook for running the ETL
-    # load_rxnav_to_neo4j.py # (Part 2)
-    # load_sider_to_neo4j.py # (Part 2)
+    load_sider_to_neo4j.py   # Part 2: SIDER side-effect TSV → Neo4j (SideEffect, HAS_SIDE_EFFECT)
+    load_faers_to_mongo.py   # Part 4: openFDA FAERS → MongoDB (raw + normalized)
+    # load_rxnav_to_neo4j.py # Part 2: RxNav API → Drug nodes + INTERACTS_WITH (if implemented)
     # load_faers_to_qdrant.py# (Part 3)
-    # load_faers_to_mongo.py # (Part 4)
   app/                       # (Part 5, to be implemented)
     # config.py              # Central DB config
     # drug_safety_check.py   # Main orchestration & reporting
@@ -76,27 +76,27 @@ source .venv/bin/activate  # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-`requirements.txt` (current) includes:
+`requirements.txt` includes:
 
-- `psycopg2-binary` — PostgreSQL driver
+- `psycopg2-binary` — PostgreSQL driver (Part 1)
 - `pandas` — CSV handling for ETL
+- `neo4j` — Neo4j driver (Part 2)
+- `pymongo`, `requests` — MongoDB and openFDA API (Part 4)
 
-Additional dependencies for Neo4j, Qdrant, MongoDB, and the app will be added as those parts are implemented.
+Additional dependencies for Qdrant and the app will be added as those parts are implemented.
 
 ### 2. Databases
 
-You will ultimately need running instances of:
+You will need running instances of:
 
-- PostgreSQL
-- Neo4j
-- Qdrant
-- MongoDB
+- **PostgreSQL** — Part 1 (required for patient data)
+- **Neo4j** — Part 2 (drug interactions and side effects)
+- **MongoDB** — Part 4 (FAERS evidence store and audit)
+- **Qdrant** — Part 3 (vector search; when implemented)
 
-For now, **Part 1** only requires **PostgreSQL**.
+For **PostgreSQL**, create a database `drug_safety` and ensure the connection URL matches what the code expects.
 
-Create a database, `drug_safety`, and ensure the connection URL matches what the code expects.
-
-Default connection URL:
+Default PostgreSQL URL:
 
 ```text
 postgresql://postgres:postgres@localhost:5432/drug_safety
@@ -170,6 +170,116 @@ The profile dict includes:
 - `recent_observations`: most recent observations (e.g., vitals, labs)
 
 These two functions are the main contract used by **Part 3 (Qdrant)** and **Part 5 (Application)**.
+
+---
+
+## Part 2 — Neo4j (Drug Interactions & Side Effects)
+
+Part 2 provides a **knowledge graph** of drugs, drug–drug interactions, and side effects for safety checks.
+
+### 1. Prerequisites
+
+- **Neo4j** running (default: `bolt://127.0.0.1:7687`).
+- **Drug nodes** must exist in the graph before loading SIDER side effects. Create them with your RxNav or DrugBank ETL (e.g. `load_rxnav_to_neo4j.py` if implemented), which should create `Drug` nodes and `INTERACTS_WITH` edges.
+
+### 2. Load SIDER Side Effects into Neo4j
+
+After Drug nodes exist, load side-effect data from the SIDER TSV:
+
+```bash
+python etl/load_sider_to_neo4j.py --file /path/to/meddra_all_se.tsv --uri bolt://127.0.0.1:7687 --user neo4j --password YOUR_PASSWORD
+```
+
+- **6-column SIDER file** (`meddra_all_se.tsv`): use optional `--drug-mapping` and `--drug-atc` TSVs to link STITCH IDs to Drug names/ATC for matching.
+- **Simplified 3-column TSV** (drug_name, side_effect_name, frequency): use `--simple`.
+
+This creates `SideEffect` nodes and `HAS_SIDE_EFFECT` relationships from drugs to side effects.
+
+### 3. Query Interface
+
+The Part 2 interface lives in `db/neo4j_queries.py`.
+
+| Function | Purpose |
+|----------|---------|
+| `check_interactions(current_med_names, proposed_drug)` | Interactions between current meds and proposed drug (severity, description). |
+| `get_side_effects(drug_name)` | Known side effects for a drug (name, frequency). |
+| `find_interaction_path(drug_a, drug_b)` | Shortest path of interactions between two drugs. |
+| `find_shared_side_effects(drug_a, drug_b)` | Side effects common to both drugs. |
+| `find_safer_alternatives(drug_name, current_meds)` | Alternatives that share indications but avoid interactions with current meds. |
+| `get_interaction_network(drug_name, depth)` | Nodes and edges around a drug up to `depth` hops. |
+| `get_drug_stats()` | Graph counts (drugs, interactions, side-effect links). |
+
+### 4. Run the Neo4j Queries Script
+
+From the project root (with Neo4j running and data loaded):
+
+```bash
+python db/neo4j_queries.py --uri bolt://127.0.0.1:7687 --user neo4j --password YOUR_PASSWORD
+```
+
+Optional arguments: `--drug` (default `Warfarin`), `--current-meds` (comma-separated, default `Aspirin`), `--alt-drug` (for path and shared-side-effect queries).
+
+Use in Python:
+
+```python
+from db.neo4j_queries import check_interactions, get_side_effects
+
+interactions = check_interactions(["Aspirin", "Metformin"], "Warfarin")
+effects = get_side_effects("Warfarin")
+```
+
+---
+
+## Part 4 — MongoDB (FAERS Evidence Store & Audit Trail)
+
+Part 4 stores **openFDA FAERS** adverse-event reports and an **audit log** of safety-check runs for traceability.
+
+### 1. Prerequisites
+
+- **MongoDB** running (default: `mongodb://localhost:27017`).
+- Override via `MONGO_URI` and `MONGO_DB` (default database: `drug_safety`).
+
+### 2. Load FAERS into MongoDB
+
+Fetch reports from the openFDA Drug Event API and write raw + normalized documents:
+
+```bash
+python etl/load_faers_to_mongo.py
+```
+
+Options:
+
+- `--mongo-uri` — MongoDB connection URI (default: `mongodb://localhost:27017`).
+- `--db` — Database name (default: `drug_safety`).
+- `--limit N` — Max number of reports to fetch (default: 500).
+- `--search 'query'` — openFDA search filter (e.g. `patient.patientsex:1`).
+- `--dry-run` — Fetch from API but do not write to MongoDB.
+
+**Collections:**
+
+- `faers_raw` — Raw API response per report; `_id` = `safetyreportid`.
+- `faers_normalized` — Flattened summary (drugs, reactions, summary text) for embedding and evidence display; same `_id` for lookup.
+- `safety_check_audit` — Audit records written by `log_safety_check()` (Part 5).
+
+### 3. Query Interface
+
+The Part 4 interface lives in `db/mongo_queries.py`.
+
+| Function | Purpose |
+|----------|---------|
+| `get_faers_reports_by_ids(faers_ids, raw=True)` | Fetch FAERS reports by `safetyreportid`; used to attach evidence to Qdrant matches. |
+| `log_safety_check(run)` | Persist one safety-check run (inputs, outputs, timestamp); returns `run_id`. |
+| `get_safety_check(run_id)` | Retrieve an audit record by `run_id`. |
+
+Use in Python:
+
+```python
+from db.mongo_queries import get_faers_reports_by_ids, log_safety_check, get_safety_check
+
+reports = get_faers_reports_by_ids(["12345", "67890"], raw=True)
+run_id = log_safety_check({"patient_id": "uuid", "proposed_drug": "Warfarin", "interactions": []})
+record = get_safety_check(run_id)
+```
 
 ---
 
@@ -283,22 +393,15 @@ The result is a **single nested JSON-like structure** that summarizes the patien
 
 ---
 
-## Planned Parts 2–5 (High Level)
+## Planned Parts 3 & 5 (High Level)
 
-Implementation for Parts 2–5 follows the design in `PROJECT_SPLIT.md`:
+Implementation follows the design in `PROJECT_SPLIT.md`:
 
-- **Part 2 (Neo4j + RxNav + SIDER)**  
-  - ETL from RxNav and SIDER into a Neo4j drug graph  
-  - Functions: `check_interactions(current_med_names, proposed_drug)`, `get_side_effects(drug_name)`
 - **Part 3 (Qdrant + openFDA FAERS)**  
-  - Embed FAERS and/or patient summaries and store vectors in Qdrant  
-  - Functions: `find_similar_adverse_events(patient_summary, drug_name, top_k)`, `find_similar_patients(patient_summary, top_k)`
-- **Part 4 (MongoDB Evidence Store + Audit Trail)**  
-  - Store raw and normalized FAERS docs  
-  - Store safety check audit logs  
-  - Functions: `get_faers_reports_by_ids(faers_ids)`, `log_safety_check(run)`, `get_safety_check(run_id)`
+  - Embed FAERS and/or patient summaries and store vectors in Qdrant (fed from MongoDB normalized docs).  
+  - Functions: `find_similar_adverse_events(patient_summary, drug_name, top_k)`, `find_similar_patients(patient_summary, top_k)`.
 - **Part 5 (Application & Integration)**  
-  - Central `config.py` for DB connection settings  
+  - Central `config.py` for DB connection settings.  
   - Main orchestrator `drug_safety_check.py` that:
     1. Reads patient profile from PostgreSQL (Part 1)
     2. Checks interactions and side effects via Neo4j (Part 2)
