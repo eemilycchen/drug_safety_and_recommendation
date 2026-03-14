@@ -1,0 +1,11 @@
+.DS_Store
+.env
+data/faers_raw.json
+data/qdrant_storage/
+synthea/output/
+__pycache__/
+*.pyc
+202/
+202 Final Report.pdf
+Project Example.pptx
+Project Outline.pdf
