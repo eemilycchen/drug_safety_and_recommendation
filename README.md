@@ -33,9 +33,10 @@ drug_safety_and_recommendation/
     load_faers_to_mongo.py   # Part 4: openFDA FAERS → MongoDB (raw + normalized)
     # load_rxnav_to_neo4j.py # Part 2: RxNav API → Drug nodes + INTERACTS_WITH (if implemented)
     # load_faers_to_qdrant.py# (Part 3)
-  app/                       # (Part 5, to be implemented)
-    # config.py              # Central DB config
-    # drug_safety_check.py   # Main orchestration & reporting
+  app/                       # Part 5 — demo and (future) orchestration
+    demo.py                  # Streamlit demo: experience all databases
+    # config.py              # Central DB config (to be implemented)
+    # drug_safety_check.py   # Main orchestration & reporting (to be implemented)
   docs/
     database_diagrams.md     # Mermaid diagrams for all four databases
     database_diagrams.html   # Browser-viewable version of the diagrams
@@ -85,8 +86,9 @@ pip install -r requirements.txt
 - `pandas` — CSV handling for ETL
 - `neo4j` — Neo4j driver (Part 2)
 - `pymongo`, `requests` — MongoDB and openFDA API (Part 4)
+- `streamlit` — Web demo (run `streamlit run app/demo.py`)
 
-Additional dependencies for Qdrant and the app will be added as those parts are implemented.
+Additional dependencies for Qdrant will be added when Part 3 is implemented.
 
 ### 2. Databases
 
@@ -106,6 +108,33 @@ postgresql://postgres:postgres@localhost:5432/drug_safety
 ```
 
 You can override this via the `PG_URL` environment variable.
+
+Neo4j and MongoDB use defaults (`NEO4J_URI`, `NEO4J_USER`, `NEO4J_PASSWORD`, `MONGO_URI`, `MONGO_DB`); set these if your instances differ.
+
+### 3. Run the Streamlit demo
+
+From the project root (with your venv activated and databases running):
+Export all of your commands:
+```bash
+export PG_URL="postgresql://postgres:<your_password>@localhost:5432/drug_safety"
+export NEO4J_URI="neo4j://127.0.0.1:7687"
+export NEO4J_USER="neo4j"
+export NEO4J_PASSWORD="<your_password>"
+streamlit run app/demo.py
+```
+
+```bash
+streamlit run app/demo.py
+```
+
+The demo lets you:
+
+- **Patient data (PostgreSQL)** — List patients, view profile, active medications, medication history, and timeline.
+- **Drug knowledge (Neo4j)** — Check interactions (current meds vs proposed drug), side effects, interaction paths, shared side effects, safer alternatives, and graph statistics.
+- **Evidence & audit (MongoDB)** — Log safety-check runs and retrieve them by `run_id`; fetch FAERS reports by ID.
+- **Full safety check** — Enter a patient ID and proposed drug; see a combined report (profile + interactions + side effects) and optionally log the run to MongoDB.
+
+If a database is unreachable, the app shows a clear error and continues for other sections.
 
 ---
 
@@ -174,7 +203,6 @@ The profile dict includes:
 - `conditions`: active conditions
 - `allergies`: active allergies
 - `recent_observations`: most recent observations (e.g., vitals, labs)
-
 - **Get full medication history** (for richer context with MongoDB / vector DB)
 
 ```python
@@ -234,15 +262,17 @@ This creates `SideEffect` nodes and `HAS_SIDE_EFFECT` relationships from drugs t
 
 The Part 2 interface lives in `db/neo4j_queries.py`.
 
-| Function | Purpose |
-|----------|---------|
-| `check_interactions(current_med_names, proposed_drug)` | Interactions between current meds and proposed drug (severity, description). |
-| `get_side_effects(drug_name)` | Known side effects for a drug (name, frequency). |
-| `find_interaction_path(drug_a, drug_b)` | Shortest path of interactions between two drugs. |
-| `find_shared_side_effects(drug_a, drug_b)` | Side effects common to both drugs. |
-| `find_safer_alternatives(drug_name, current_meds)` | Alternatives that share indications but avoid interactions with current meds. |
-| `get_interaction_network(drug_name, depth)` | Nodes and edges around a drug up to `depth` hops. |
-| `get_drug_stats()` | Graph counts (drugs, interactions, side-effect links). |
+
+| Function                                               | Purpose                                                                       |
+| ------------------------------------------------------ | ----------------------------------------------------------------------------- |
+| `check_interactions(current_med_names, proposed_drug)` | Interactions between current meds and proposed drug (severity, description).  |
+| `get_side_effects(drug_name)`                          | Known side effects for a drug (name, frequency).                              |
+| `find_interaction_path(drug_a, drug_b)`                | Shortest path of interactions between two drugs.                              |
+| `find_shared_side_effects(drug_a, drug_b)`             | Side effects common to both drugs.                                            |
+| `find_safer_alternatives(drug_name, current_meds)`     | Alternatives that share indications but avoid interactions with current meds. |
+| `get_interaction_network(drug_name, depth)`            | Nodes and edges around a drug up to `depth` hops.                             |
+| `get_drug_stats()`                                     | Graph counts (drugs, interactions, side-effect links).                        |
+
 
 ### 4. Run the Neo4j Queries Script
 
@@ -300,11 +330,13 @@ Options:
 
 The Part 4 interface lives in `db/mongo_queries.py`.
 
-| Function | Purpose |
-|----------|---------|
+
+| Function                                        | Purpose                                                                             |
+| ----------------------------------------------- | ----------------------------------------------------------------------------------- |
 | `get_faers_reports_by_ids(faers_ids, raw=True)` | Fetch FAERS reports by `safetyreportid`; used to attach evidence to Qdrant matches. |
-| `log_safety_check(run)` | Persist one safety-check run (inputs, outputs, timestamp); returns `run_id`. |
-| `get_safety_check(run_id)` | Retrieve an audit record by `run_id`. |
+| `log_safety_check(run)`                         | Persist one safety-check run (inputs, outputs, timestamp); returns `run_id`.        |
+| `get_safety_check(run_id)`                      | Retrieve an audit record by `run_id`.                                               |
+
 
 Use in Python:
 
