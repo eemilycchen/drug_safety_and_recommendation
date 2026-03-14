@@ -129,7 +129,7 @@ All of these:
 
 ---
 
-## Design Choices (plain English)
+## Design Choices
 
 - **Dense vectors only** — No sparse vectors in Qdrant; everything is 768‑dim dense from BioLORD.
 - **Cosine distance** — Fits normalized embeddings; “closest” means highest cosine similarity.
