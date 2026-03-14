@@ -20,7 +20,7 @@ drug_safety_and_recommendation/
   db/
     __init__.py
     pg_schema.sql            # PostgreSQL DDL for Synthea data 
-    pg_queries.py            # get_active_medications(), get_patient_profile(), helpers
+    pg_queries.py            # get_active_medications(), get_patient_profile(), get_medication_history(), get_patient_timeline(), validate_timeline_consistency()
     pg_queries.ipynb         # Notebook for exploring pg_queries
     neo4j_queries.py         # Part 2: check_interactions(), get_side_effects(), etc.
     mongo_queries.py         # Part 4: get_faers_reports_by_ids(), log_safety_check(), etc.
@@ -36,6 +36,9 @@ drug_safety_and_recommendation/
   app/                       # (Part 5, to be implemented)
     # config.py              # Central DB config
     # drug_safety_check.py   # Main orchestration & reporting
+  docs/
+    database_diagrams.md     # Mermaid diagrams for all four databases
+    database_diagrams.html   # Browser-viewable version of the diagrams
   .gitignore
   PROJECT_SPLIT.md           # Detailed split of parts 1–5, responsibilities, contracts
   plan.md                    # High-level goals
@@ -112,9 +115,12 @@ Part 1 is responsible for:
 
 - Designing the relational schema for Synthea data
 - Loading all Synthea CSVs into PostgreSQL
-- Exposing a minimal, well-defined interface for other parts:
-  - `get_active_medications(patient_id)`
-  - `get_patient_profile(patient_id)`
+- Exposing a well-defined interface for other parts:
+  - `get_active_medications(patient_id)` — current medications only
+  - `get_patient_profile(patient_id)` — current state (demographics, active meds, conditions, allergies, recent observations)
+  - `get_medication_history(patient_id, limit=100, years_back=None, since_date=None)` — full medication history with optional filters
+  - `get_patient_timeline(patient_id, since_date=None, event_types=None)` — chronological clinical events (medication, condition, encounter, procedure)
+  - `validate_timeline_consistency(timeline_events)` — optional validation helper for timeline data
 
 ### 1. Load Synthea CSVs into PostgreSQL
 
@@ -141,7 +147,7 @@ python etl/load_synthea_to_pg.py --no-schema
 
 ### 2. Query Helpers
 
-The core Part 1 interface lives in `db/pg_queries.py`.
+The core Part 1 interface lives in `db/pg_queries.py`. There is also a convenience helper `list_patients(limit=20)` for demos.
 
 - **Get active medications for a patient**
 
@@ -169,7 +175,36 @@ The profile dict includes:
 - `allergies`: active allergies
 - `recent_observations`: most recent observations (e.g., vitals, labs)
 
-These two functions are the main contract used by **Part 3 (Qdrant)** and **Part 5 (Application)**.
+- **Get full medication history** (for richer context with MongoDB / vector DB)
+
+```python
+from db.pg_queries import get_medication_history
+
+history = get_medication_history(patient_id="some-uuid", limit=100, years_back=5)  # or since_date="2020-01-01"
+```
+
+Returns all medication records (current and past), newest first. Optional filters: `limit`, `years_back`, or `since_date` (ISO date). Cannot use both `years_back` and `since_date`.
+
+- **Get a single chronological timeline** (medications, conditions, encounters, procedures)
+
+```python
+from db.pg_queries import get_patient_timeline
+
+timeline = get_patient_timeline(patient_id="some-uuid", since_date="2022-01-01", event_types=["medication", "condition"])
+```
+
+Each event has `date`, `type`, `description`, `end_date`, and `details`. Default `event_types` is all four.
+
+- **Validate timeline data** (optional, for debugging)
+
+```python
+from db.pg_queries import validate_timeline_consistency
+
+result = validate_timeline_consistency(timeline)
+# result: { "valid": True/False, "issues": [...], "event_count": N, "date_range": {...} }
+```
+
+`get_active_medications` and `get_patient_profile` are the main contract used by **Part 3 (Qdrant)** and **Part 5 (Application)**. `get_medication_history` and `get_patient_timeline` support richer patient context for embeddings, evidence, and audit.
 
 ---
 

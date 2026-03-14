@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Database Diagrams — Drug Safety & Recommendation</title>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+  <script>
+    mermaid.initialize({
+      startOnLoad: true,
+      theme: 'neutral',
+      er: { useMaxWidth: true },
+      flowchart: { useMaxWidth: true }
+    });
+  </script>
+  <style>
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      max-width: 1000px;
+      margin: 0 auto;
+      padding: 1.5rem;
+      color: #1a1a1a;
+      background: #fafafa;
+    }
+    h1 { font-size: 1.5rem; margin-top: 0; }
+    h2 { font-size: 1.2rem; margin-top: 2rem; border-bottom: 1px solid #ddd; padding-bottom: 0.25rem; }
+    p, ul { line-height: 1.5; color: #333; }
+    .mermaid { margin: 1.5rem 0; text-align: center; }
+    .diagram-caption { font-size: 0.9rem; color: #555; margin-top: 0.5rem; }
+    table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: 0.9rem; }
+    th, td { border: 1px solid #ddd; padding: 0.5rem 0.75rem; text-align: left; }
+    th { background: #eee; }
+  </style>
+</head>
+<body>
+  <h1>Database Diagrams — Drug Safety & Recommendation</h1>
+  <p>Four databases and how they are structured. Rendered with Mermaid.</p>
+
+  <h2>1. PostgreSQL (Relational) — Synthea patient data</h2>
+  <p><strong>Role:</strong> Patient state — demographics, encounters, active medications, conditions, allergies, observations. The schema supports both current-state queries (<code>get_patient_profile</code>, <code>get_active_medications</code>) and history/timeline queries (<code>get_medication_history</code>, <code>get_patient_timeline</code>) for richer context in MongoDB and the vector DB.</p>
+  <p><strong>Data source:</strong> Synthea CSV exports. Star schema: <code>patients</code> at the center.</p>
+  <div class="mermaid">
+erDiagram
+    organizations ||--o{ providers : "employs"
+    patients ||--o{ encounters : "has"
+    encounters }o--o| organizations : "at"
+    encounters }o--o| providers : "with"
+    encounters }o--o| payers : "payer"
+    patients ||--o{ medications : "has"
+    encounters ||--o{ medications : "at"
+    patients ||--o{ conditions : "has"
+    encounters ||--o{ conditions : "at"
+    patients ||--o{ allergies : "has"
+    encounters ||--o{ allergies : "at"
+    patients ||--o{ observations : "has"
+    encounters ||--o{ procedures : "at"
+    patients ||--o{ procedures : "has"
+    patients ||--o{ immunizations : "has"
+    patients ||--o{ careplans : "has"
+    patients ||--o{ payer_transitions : "has"
+
+    organizations {
+        uuid id PK
+        text name
+        text address
+        text city
+        text state
+    }
+
+    payers {
+        uuid id PK
+        text name
+    }
+
+    providers {
+        uuid id PK
+        uuid organization FK
+        text name
+        text speciality
+    }
+
+    patients {
+        uuid id PK
+        date birthdate
+        date deathdate
+        text first_name
+        text last_name
+        text gender
+        text address
+        text city
+        text state
+    }
+
+    encounters {
+        uuid id PK
+        timestamptz start_ts
+        timestamptz stop_ts
+        uuid patient FK
+        uuid organization FK
+        uuid provider FK
+        uuid payer FK
+        text encounterclass
+        text description
+    }
+
+    medications {
+        serial id PK
+        timestamptz start_ts
+        timestamptz stop_ts
+        uuid patient FK
+        uuid encounter FK
+        text code
+        text description
+    }
+
+    conditions {
+        serial id PK
+        date start_date
+        date stop_date
+        uuid patient FK
+        uuid encounter FK
+        text code
+        text description
+    }
+
+    allergies {
+        serial id PK
+        date start_date
+        date stop_date
+        uuid patient FK
+        uuid encounter FK
+        text code
+        text description
+    }
+
+    observations {
+        serial id PK
+        timestamptz obs_date
+        uuid patient FK
+        uuid encounter FK
+        text code
+        text value
+    }
+  </div>
+
+  <h2>2. Neo4j (Graph) — Drug interactions & side effects</h2>
+  <p><strong>Role:</strong> Drug–drug interactions and drug–side-effect relationships.</p>
+  <p><strong>Data sources:</strong> RxNav (interactions), SIDER (side effects). <strong>Nodes:</strong> Drug, SideEffect. <strong>Relationships:</strong> INTERACTS_WITH, HAS_SIDE_EFFECT.</p>
+  <div class="mermaid">
+flowchart LR
+    subgraph nodes["Node types"]
+        D1[(Drug)]
+        D2[(Drug)]
+        SE[(SideEffect)]
+    end
+
+    subgraph relationships["Relationships"]
+        D1 <-.->|INTERACTS_WITH severity, description| D2
+        D1 -->|HAS_SIDE_EFFECT frequency| SE
+    end
+  </div>
+  <p class="diagram-caption">Schema: node types and relationship types.</p>
+  <div class="mermaid">
+flowchart LR
+    A[Aspirin Drug]
+    B[Warfarin Drug]
+    C[Metformin Drug]
+    S1[Nausea SideEffect]
+    S2[Bleeding SideEffect]
+
+    A <-->|INTERACTS_WITH| B
+    B -->|HAS_SIDE_EFFECT| S1
+    B -->|HAS_SIDE_EFFECT| S2
+    C -->|HAS_SIDE_EFFECT| S1
+  </div>
+  <p class="diagram-caption">Example: Aspirin–Warfarin interaction; Warfarin and Metformin side effects.</p>
+
+  <h2>3. Qdrant (Vector) — Similar adverse events</h2>
+  <p><strong>Role:</strong> Similarity search over embedded adverse event reports.</p>
+  <p><strong>Data source:</strong> openFDA FAERS (often via normalized docs from MongoDB). Each point = vector (embedding) + payload (e.g. report id, drug names).</p>
+  <div class="mermaid">
+flowchart TB
+    subgraph Qdrant["Qdrant collection(s)"]
+        direction TB
+        P1["Point 1: vector + payload (faers_id, drugs, ...)"]
+        P2["Point 2: vector + payload"]
+        P3["Point 3: vector + payload"]
+        P1 --- P2
+        P2 --- P3
+    end
+
+    subgraph Input["Input"]
+        Q["Query vector (patient + drug summary)"]
+    end
+
+    Q -->|similarity search top_k nearest| Qdrant
+    Qdrant -->|returns| R["Similar FAERS report IDs + scores"]
+  </div>
+
+  <h2>4. MongoDB (Document) — Evidence & audit</h2>
+  <p><strong>Role:</strong> Raw FAERS documents, normalized summaries for embedding/lookup, and audit log of each safety check.</p>
+  <p><strong>Database:</strong> <code>drug_safety</code>. Three main collections.</p>
+  <div class="mermaid">
+flowchart TB
+    subgraph MongoDB["MongoDB database: drug_safety"]
+        subgraph faers_raw["faers_raw"]
+            R1["Doc: raw openFDA API response"]
+            R2["Doc: raw openFDA API response"]
+            R1 --- R2
+        end
+
+        subgraph faers_normalized["faers_normalized"]
+            N1["Doc: _id, summary, drugs[], reactions[], receivedate, ..."]
+            N2["Doc: same structure"]
+            N1 --- N2
+        end
+
+        subgraph safety_check_audit["safety_check_audit"]
+            A1["Doc: run_id, patient_id, proposed_drug, inputs, outputs, timestamp"]
+            A2["Doc: run record"]
+            A1 --- A2
+        end
+    end
+
+    faers_raw -.->|same _id = safetyreportid| faers_normalized
+  </div>
+  <table>
+    <thead>
+      <tr><th>Collection</th><th>Purpose</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>faers_raw</code></td><td>Raw JSON from openFDA; <code>_id</code> = safetyreportid. Traceability.</td></tr>
+      <tr><td><code>faers_normalized</code></td><td>Flattened doc (summary, drugs, reactions, dates) for embedding and evidence; same <code>_id</code> for lookup.</td></tr>
+      <tr><td><code>safety_check_audit</code></td><td>One document per safety-check run: inputs, outputs, timestamp.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>All four in one view</h2>
+  <div class="mermaid">
+flowchart LR
+    subgraph PG["PostgreSQL"]
+        P[patients]
+        E[encounters]
+        M[medications]
+        P --- E
+        P --- M
+    end
+
+    subgraph N4["Neo4j"]
+        D[(Drug)]
+        S[(SideEffect)]
+        D --- S
+    end
+
+    subgraph Q["Qdrant"]
+        V[Vectors]
+    end
+
+    subgraph MON["MongoDB"]
+        F[faers_raw / faers_normalized]
+        A[safety_check_audit]
+    end
+
+    PG --> N4
+    N4 --> Q
+    Q --> MON
+  </div>
+</body>
+</html>
