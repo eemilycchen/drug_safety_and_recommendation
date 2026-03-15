@@ -1,10 +1,9 @@
 """
 Part 2: ETL — Parse DrugBank full database XML and load drug–drug interactions into Neo4j.
-Creates Drug nodes and INTERACTS_WITH relationships (same schema as load_rxnav_to_neo4j).
+Creates Drug nodes and INTERACTS_WITH relationships.
 
-Use this when you have a DrugBank XML export (e.g. full database.xml) instead of or
-in addition to the NLM RxNav Interaction API. Drug nodes use drugbank-id as the
-unique key (stored in rxcui for schema compatibility).
+Drug nodes use drugbank-id as the unique key (stored in rxcui for schema compatibility).
+Side effects are loaded separately by load_sider_to_neo4j.py (SIDER has proper MedDRA terms).
 """
 
 import argparse
@@ -15,11 +14,39 @@ from pathlib import Path
 
 from neo4j import GraphDatabase
 
-NS = {"db": "http://www.drugbank.ca"}
-
 
 def get_connection(uri: str, user: str, password: str):
     return GraphDatabase.driver(uri, auth=(user, password))
+
+
+def _interaction_severity_and_weight(description: str) -> tuple[str, int]:
+    """
+    Derive severity and numeric weight from interaction description text.
+    Weight: 3 = major, 2 = moderate, 1 = minor.
+    """
+    if not description:
+        return "unknown", 1
+    d = description.lower()
+    if any(kw in d for kw in (
+        "contraindicated", "fatal", "serotonin syndrome",
+        "qt prolongation", "cardiac arrest", "torsade",
+        "life-threatening", "do not use", "avoid",
+    )):
+        return "major", 3
+    if any(kw in d for kw in ("hemorrhage", "bleeding", "seizure", "hypotension")):
+        return "major", 3
+    if any(kw in d for kw in (
+        "risk or severity", "risk of", "increase the risk",
+        "nephrotoxic", "hepatotoxic", "neurotoxic",
+        "adverse effects can be increased",
+    )):
+        return "moderate", 2
+    if any(kw in d for kw in (
+        "may increase", "may decrease", "serum concentration",
+        "activities of", "metabolism of", "absorption of",
+    )):
+        return "minor", 1
+    return "unknown", 1
 
 
 def ensure_constraints(session):
@@ -27,13 +54,9 @@ def ensure_constraints(session):
 
 
 def build_atc_map(xml_path: str) -> dict[str, list[str]]:
-    """
-    First pass: scan every <drug> block and record drugbank_id -> atc_codes.
-    Ensures we never flush interaction targets with atc_codes=[] when the XML
-    actually has ATC later in that drug's block (avoids overwriting good data).
-    """
+    """First pass: scan every <drug> block and record drugbank_id -> atc_codes."""
     atc_map: dict[str, list[str]] = {}
-    current = {"id": None, "name": None, "atc_codes": []}
+    current = {"id": None, "atc_codes": []}
     take_next_name = False
 
     for event, elem in ET.iterparse(xml_path, events=("start", "end")):
@@ -44,25 +67,21 @@ def build_atc_map(xml_path: str) -> dict[str, list[str]]:
 
         if event == "start":
             if local == "drug":
-                current = {"id": None, "name": None, "atc_codes": []}
+                current = {"id": None, "atc_codes": []}
                 take_next_name = False
             continue
 
         if local == "drugbank-id" and elem.get("primary") == "true" and elem.text:
             current["id"] = elem.text.strip()
             take_next_name = True
-        elif local == "name":
-            text = (elem.text or "").strip()
-            if take_next_name and text:
-                current["name"] = text
-                take_next_name = False
+        elif local == "name" and take_next_name:
+            take_next_name = False
         elif local == "atc-code" and elem.get("code"):
             current["atc_codes"].append(elem.get("code").strip())
         elif local == "drug-interaction":
             elem.clear()
         elif local == "drug":
-            if current["id"] and current["name"]:
-                # Keep list from XML; multiple atc-code elements possible
+            if current["id"]:
                 atc_map[current["id"]] = list(current["atc_codes"])
             elem.clear()
 
@@ -71,12 +90,11 @@ def build_atc_map(xml_path: str) -> dict[str, list[str]]:
 
 def iter_drugbank_drugs(xml_path: str):
     """
-    Yield (drugbank_id, drug_name, atc_codes, interactions) from DrugBank XML using streaming parse.
-    atc_codes: list[str] from <atc-code code="X"> elements.
+    Yield (drugbank_id, drug_name, atc_codes, interactions) from DrugBank XML.
     interactions: list[(other_id, other_name, description)]
     """
     current = {"id": None, "name": None, "atc_codes": [], "interactions": []}
-    take_next_name = False  # first <name> after primary <drugbank-id> in this <drug>
+    take_next_name = False
 
     for event, elem in ET.iterparse(xml_path, events=("start", "end")):
         tag = elem.tag
@@ -90,7 +108,6 @@ def iter_drugbank_drugs(xml_path: str):
                 take_next_name = False
             continue
 
-        # event == "end"
         if local == "drugbank-id" and elem.get("primary") == "true" and elem.text:
             current["id"] = elem.text.strip()
             take_next_name = True
@@ -121,13 +138,7 @@ def iter_drugbank_drugs(xml_path: str):
 
 
 def flush_batch(session, drugs: list[dict], edges: list[dict]) -> None:
-    """
-    Upsert drugs and edges using UNWIND batches (fast).
-    drugs: [{"id", "name", "atc_codes": [...]}]
-    """
     if drugs:
-        # Only set atc_codes when we have a non-empty list (don't overwrite with [] for targets)
-        # d.atc_codes comes from atc_map (pass 1); only overwrite when non-empty
         session.run(
             """
             UNWIND $drugs AS d
@@ -150,8 +161,9 @@ def flush_batch(session, drugs: list[dict], edges: list[dict]) -> None:
             MERGE (d2:Drug {rxcui: e.tgt_id})
             SET d2.name = coalesce(d2.name, e.tgt_name)
             MERGE (d1)-[r:INTERACTS_WITH]->(d2)
-            SET r.severity = 'unknown',
-                r.description = e.description
+            SET r.severity = e.severity,
+                r.description = e.description,
+                r.weight = e.weight
             """,
             edges=edges,
         )
@@ -163,12 +175,6 @@ def load_drugbank_interactions_batched(
     batch_edges: int = 100_000,
     atc_map: dict[str, list[str]] | None = None,
 ) -> tuple[int, int]:
-    """
-    Stream DrugBank XML and write to Neo4j in batches of approximately `batch_edges` edges.
-    If atc_map is provided (from build_atc_map), every drug in a flush uses XML ATC
-    so targets are never written with [] when their block has atc-codes.
-    Returns (drugs_with_interactions_processed, edges_written).
-    """
     if atc_map is None:
         atc_map = {}
 
@@ -177,7 +183,7 @@ def load_drugbank_interactions_batched(
             return atc_map[drug_id]
         return list(fallback) if fallback else []
 
-    drugs_seen: dict[str, dict] = {}  # id -> {name, atc_codes}
+    drugs_seen: dict[str, dict] = {}
     pending_edges: list[dict] = []
     processed_drugs = 0
     processed_edges = 0
@@ -197,15 +203,17 @@ def load_drugbank_interactions_batched(
                     "name": other_name,
                     "atc_codes": atc_for(other_id, []),
                 }
-            pending_edges.append(
-                {
-                    "src_id": drugbank_id,
-                    "src_name": drug_name,
-                    "tgt_id": other_id,
-                    "tgt_name": other_name,
-                    "description": (description or "DrugBank interaction")[:2000],
-                }
-            )
+            desc = (description or "DrugBank interaction")[:2000]
+            severity, weight = _interaction_severity_and_weight(desc)
+            pending_edges.append({
+                "src_id": drugbank_id,
+                "src_name": drug_name,
+                "tgt_id": other_id,
+                "tgt_name": other_name,
+                "description": desc,
+                "severity": severity,
+                "weight": weight,
+            })
         if len(pending_edges) >= batch_edges or len(drugs_seen) >= 20_000:
             flush_drugs = [
                 {"id": k, "name": v["name"], "atc_codes": atc_for(k, v.get("atc_codes"))}
@@ -226,7 +234,6 @@ def load_drugbank_interactions_batched(
             )
             last_flush = now
 
-    # final flush
     if drugs_seen or pending_edges:
         flush_drugs = [
             {"id": k, "name": v["name"], "atc_codes": atc_for(k, v.get("atc_codes"))}
@@ -240,10 +247,9 @@ def load_drugbank_interactions_batched(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Load DrugBank full database XML drug–drug interactions into Neo4j"
+        description="Load DrugBank XML drug–drug interactions into Neo4j"
     )
     parser.add_argument("--file", "-f", required=True, help="Path to DrugBank full database.xml")
-    # Use IPv4 by default to avoid localhost->IPv6 (::1) connection issues.
     parser.add_argument("--uri", default="bolt://127.0.0.1:7687")
     parser.add_argument("--user", default="neo4j")
     parser.add_argument("--password", default="password")
@@ -251,7 +257,7 @@ def main():
         "--batch-edges",
         type=int,
         default=100_000,
-        help="Approx edges per Neo4j batch write (tune to ~30 minutes on your machine)",
+        help="Approx edges per Neo4j batch write",
     )
     args = parser.parse_args()
 
@@ -264,16 +270,17 @@ def main():
     try:
         with driver.session() as session:
             ensure_constraints(session)
-            print("Pass 1: building ATC map from XML (one full scan)...")
+            print("Pass 1: building ATC map from XML...")
             t_atc = time.time()
             atc_map = build_atc_map(str(path))
-            print(f"  ATC map size: {len(atc_map)} drugs ({time.time() - t_atc:.1f}s).")
+            print(f"  ATC map: {len(atc_map)} drugs ({time.time() - t_atc:.1f}s)")
             with_atc = sum(1 for v in atc_map.values() if v)
-            print(f"  Drugs with at least one ATC code: {with_atc}")
+            print(f"  Drugs with ATC: {with_atc}")
+            print("Pass 2: loading interactions...")
             num_drugs, num_edges = load_drugbank_interactions_batched(
-                session, str(path), batch_edges=args.batch_edges, atc_map=atc_map
+                session, str(path), batch_edges=args.batch_edges, atc_map=atc_map,
             )
-        print(f"Loaded {num_drugs} drugs and {num_edges} INTERACTS_WITH edges from DrugBank XML.")
+        print(f"Done. {num_drugs} drugs, {num_edges} INTERACTS_WITH edges.")
     finally:
         driver.close()
 
