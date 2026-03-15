@@ -12,6 +12,11 @@ Collections:
 Usage:
     python etl/load_faers_to_mongo.py
     python etl/load_faers_to_mongo.py --limit 500 --search 'patient.patientsex:1'
+
+For MongoDB Atlas (as in the notebook), set MONGO_URI and MONGO_DB before running:
+    export MONGO_URI="mongodb+srv://user:password@cluster.mongodb.net/?..."
+    export MONGO_DB="drug_safety"
+    python etl/load_faers_to_mongo.py --limit 100
 """
 
 from __future__ import annotations
@@ -28,6 +33,7 @@ import requests
 try:
     from pymongo import MongoClient
     from pymongo.collection import Collection
+    from pymongo.operations import ReplaceOne
     HAS_PYMONGO = True
 except ImportError:
     HAS_PYMONGO = False
@@ -152,15 +158,15 @@ def load_faers_to_mongo(
         if not results:
             break
 
+        raw_ops = []
+        norm_ops = []
         for report in results:
             report_id = _report_id(report)
             if not report_id:
                 continue
 
-            # Store raw with _id = safetyreportid for get_faers_reports_by_ids
             raw_doc = dict(report)
             raw_doc["_id"] = report_id
-
             norm_doc = _normalize_report(report)
 
             if dry_run:
@@ -168,10 +174,14 @@ def load_faers_to_mongo(
                 total_norm += 1
                 continue
 
-            raw_coll.replace_one({"_id": report_id}, raw_doc, upsert=True)
-            norm_coll.replace_one({"_id": report_id}, norm_doc, upsert=True)
-            total_raw += 1
-            total_norm += 1
+            raw_ops.append(ReplaceOne({"_id": report_id}, raw_doc, upsert=True))
+            norm_ops.append(ReplaceOne({"_id": report_id}, norm_doc, upsert=True))
+
+        if raw_ops and not dry_run:
+            raw_coll.bulk_write(raw_ops, ordered=False)
+            norm_coll.bulk_write(norm_ops, ordered=False)
+            total_raw += len(raw_ops)
+            total_norm += len(norm_ops)
 
         skip += len(results)
         if len(results) < fetch_limit or (max_reports is not None and total_raw >= max_reports):
@@ -214,6 +224,15 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    # Progress output so running the script shows immediate feedback
+    mongo_display = args.mongo_uri if len(args.mongo_uri) <= 60 else args.mongo_uri[:57] + "..."
+    print(f"FAERS → MongoDB: limit={args.limit}, db={args.db}", flush=True)
+    print(f"MongoDB: {mongo_display}", flush=True)
+    if args.dry_run:
+        print("(dry run — no writes)", flush=True)
+    else:
+        print("Fetching from openFDA and writing to MongoDB...", flush=True)
+
     raw_count, norm_count = load_faers_to_mongo(
         mongo_uri=args.mongo_uri,
         db_name=args.db,
@@ -221,7 +240,7 @@ def main() -> None:
         max_reports=args.limit,
         dry_run=args.dry_run,
     )
-    print(f"Written: {raw_count} raw, {norm_count} normalized" + (" (dry run)" if args.dry_run else ""))
+    print(f"Written: {raw_count} raw, {norm_count} normalized" + (" (dry run)" if args.dry_run else ""), flush=True)
 
 
 if __name__ == "__main__":

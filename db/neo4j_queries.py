@@ -316,6 +316,105 @@ def get_drug_stats(
         driver.close()
 
 
+def seed_sample_graph(
+    uri: str = "bolt://127.0.0.1:7687",
+    user: str = "neo4j",
+    password: str = "password",
+) -> dict:
+    """
+    Load a small sample graph (Drugs, SideEffects, INTERACTS_WITH, HAS_SIDE_EFFECT)
+    so the demo works without running the full SIDER/RxNav ETL.
+    Idempotent: uses MERGE so safe to run multiple times.
+    Returns counts: {drugs, side_effects, interactions, side_effect_links}.
+    """
+    driver = get_connection(uri, user=user, password=password)
+    try:
+        with driver.session() as session:
+            # Sample drugs (match SAMPLE_DRUGS in app/demo.py)
+            drugs = [
+                "Warfarin", "Aspirin", "Metformin", "Ibuprofen", "Lisinopril", "Amlodipine",
+                "Apixaban", "Naproxen",
+            ]
+            for name in drugs:
+                session.run("MERGE (d:Drug {name: $name})", name=name)
+
+            # Sample side effects with unique meddra_id (required by constraint if it exists)
+            side_effects = [
+                ("sample_se_bleeding", "Bleeding"),
+                ("sample_se_gi", "Gastrointestinal bleeding"),
+                ("sample_se_nausea", "Nausea"),
+                ("sample_se_dizziness", "Dizziness"),
+                ("sample_se_edema", "Edema"),
+                ("sample_se_hypoglycemia", "Hypoglycemia"),
+                ("sample_se_renal", "Renal impairment"),
+            ]
+            for meddra_id, se_name in side_effects:
+                session.run(
+                    "MERGE (s:SideEffect {meddra_id: $meddra_id}) SET s.name = $name",
+                    meddra_id=meddra_id, name=se_name,
+                )
+
+            # Drug–drug interactions (INTERACTS_WITH)
+            interactions = [
+                ("Warfarin", "Aspirin", "major", "Increased risk of bleeding"),
+                ("Warfarin", "Ibuprofen", "major", "Increased bleeding risk"),
+                ("Aspirin", "Ibuprofen", "moderate", "Reduced aspirin efficacy; GI risk"),
+                ("Warfarin", "Apixaban", "major", "Avoid concurrent anticoagulants"),
+                ("Metformin", "Lisinopril", "minor", "Possible additive effect on kidney function"),
+            ]
+            for a, b, severity, desc in interactions:
+                session.run(
+                    """
+                    MERGE (d1:Drug {name: $a})
+                    MERGE (d2:Drug {name: $b})
+                    MERGE (d1)-[r:INTERACTS_WITH]-(d2)
+                    SET r.severity = $severity, r.description = $desc
+                    """,
+                    a=a, b=b, severity=severity, desc=desc,
+                )
+
+            # Drug -> SideEffect (HAS_SIDE_EFFECT)
+            drug_side_effects = [
+                ("Warfarin", "sample_se_bleeding", "common"),
+                ("Warfarin", "sample_se_gi", "common"),
+                ("Aspirin", "sample_se_gi", "common"),
+                ("Aspirin", "sample_se_nausea", "common"),
+                ("Ibuprofen", "sample_se_gi", "common"),
+                ("Ibuprofen", "sample_se_renal", "uncommon"),
+                ("Metformin", "sample_se_nausea", "common"),
+                ("Metformin", "sample_se_hypoglycemia", "common"),
+                ("Lisinopril", "sample_se_dizziness", "common"),
+                ("Lisinopril", "sample_se_edema", "uncommon"),
+                ("Amlodipine", "sample_se_edema", "common"),
+                ("Amlodipine", "sample_se_dizziness", "common"),
+                ("Apixaban", "sample_se_bleeding", "common"),
+            ]
+            for drug_name, meddra_id, freq in drug_side_effects:
+                session.run(
+                    """
+                    MERGE (d:Drug {name: $drug_name})
+                    MERGE (s:SideEffect {meddra_id: $meddra_id})
+                    MERGE (d)-[r:HAS_SIDE_EFFECT]->(s)
+                    SET r.frequency = $freq
+                    """,
+                    drug_name=drug_name, meddra_id=meddra_id, freq=freq,
+                )
+
+            # Return counts
+            r = session.run(
+                """
+                MATCH (d:Drug) WITH count(d) AS drugs
+                MATCH (se:SideEffect) WITH drugs, count(se) AS side_effects
+                MATCH ()-[i:INTERACTS_WITH]-() WITH drugs, side_effects, count(i)/2 AS interactions
+                MATCH ()-[h:HAS_SIDE_EFFECT]->()
+                RETURN drugs, side_effects, interactions, count(h) AS side_effect_links
+                """
+            ).single()
+            return dict(r) if r else {}
+    finally:
+        driver.close()
+
+
 if __name__ == "__main__":
     import argparse
 

@@ -1,8 +1,8 @@
 """
 Streamlit demo: Drug Safety & Recommendation
 =============================================
-Experience what each database can do — patient data (PostgreSQL),
-drug interactions & side effects (Neo4j), and evidence/audit (MongoDB).
+Single demo for all databases: PostgreSQL (patients), Neo4j (interactions),
+Qdrant (similar adverse events), MongoDB (evidence & audit).
 Run from project root: streamlit run app/demo.py
 """
 
@@ -41,6 +41,13 @@ except Exception as e:
     HAS_MONGO = False
     _MONGO_ERR = str(e)
 
+try:
+    from db import qdrant_queries
+    HAS_QDRANT = True
+except Exception as e:
+    HAS_QDRANT = False
+    _QDRANT_ERR = str(e)
+
 
 # ── Config (env or defaults) ─────────────────────────────────────────────
 def _pg_url():
@@ -53,6 +60,56 @@ def _neo4j_kw():
         "user": os.getenv("NEO4J_USER", "neo4j"),
         "password": os.getenv("NEO4J_PASSWORD", "password"),
     }
+
+
+# ── Sample data for immediate use (no DB required for drug/summary defaults) ──
+SAMPLE_PATIENT_SUMMARY = (
+    "65 year old male, type 2 diabetes and hypertension, on metformin and aspirin."
+)
+SAMPLE_DRUGS = ["Warfarin", "Aspirin", "Metformin", "Ibuprofen", "Lisinopril", "Amlodipine"]
+
+
+def _get_sample_patients():
+    """Load first N patients from PostgreSQL once per session for dropdowns."""
+    if "sample_patients" not in st.session_state:
+        st.session_state.sample_patients = []
+        if HAS_PG:
+            try:
+                st.session_state.sample_patients = pg_queries.list_patients(
+                    limit=15, db_url=_pg_url()
+                )
+            except Exception:
+                pass
+    return st.session_state.sample_patients
+
+
+def _patient_summary_from_profile(profile: dict) -> str:
+    """Build a short text summary from get_patient_profile() for Qdrant similarity search."""
+    p = profile.get("patient", {})
+    age = p.get("birthdate", "Unknown age")
+    if age and age != "Unknown age":
+        try:
+            from datetime import date
+            birth = date.fromisoformat(age[:10]) if isinstance(age, str) else age
+            age = (date.today() - birth).days // 365
+        except Exception:
+            age = "Unknown age"
+    gender = p.get("gender", "unknown")
+    conditions = profile.get("conditions", [])
+    cond_str = ", ".join(
+        c.get("description", c.get("code", "")) if isinstance(c, dict) else str(c)
+        for c in (conditions or [])
+    ) or "none"
+    meds = profile.get("active_medications", [])
+    med_str = ", ".join(
+        m.get("description", m.get("code", "")) if isinstance(m, dict) else str(m)
+        for m in (meds or [])
+    ) or "none"
+    return (
+        f"Patient: {age} year old {gender}. "
+        f"Conditions: {cond_str}. "
+        f"Medications: {med_str}."
+    )
 
 
 # ── Page: Patient data (PostgreSQL) ───────────────────────────────────────
@@ -148,10 +205,38 @@ def page_patient_data():
             st.dataframe(timeline if timeline else [{"message": "No events"}], use_container_width=True)
 
 
+def _render_network_graph(net: dict, height: int = 420) -> None:
+    """Render nodes/edges from get_interaction_network as an interactive pyvis graph."""
+    nodes = net.get("nodes") or []
+    edges = net.get("edges") or []
+    if not nodes and not edges:
+        return
+    try:
+        from pyvis.network import Network
+        g = Network(height=f"{height}px", width="100%", directed=False)
+        for n in nodes:
+            name = n.get("name") or str(n)
+            g.add_node(name, label=name, title=name)
+        seen_edges = set()
+        for e in edges:
+            src, tgt = e.get("source"), e.get("target")
+            if not src or not tgt:
+                continue
+            key = (min(src, tgt), max(src, tgt))
+            if key in seen_edges:
+                continue
+            seen_edges.add(key)
+            g.add_edge(src, tgt, title=e.get("description") or "interaction")
+        html = g.generate_html()
+        st.components.v1.html(html, height=height + 20, scrolling=False)
+    except ImportError:
+        st.caption("Install `pyvis` for graph visualization: pip install pyvis")
+
+
 # ── Page: Drug knowledge (Neo4j) ───────────────────────────────────────────
 def page_drug_knowledge():
     st.header("Drug knowledge (Neo4j)")
-    st.caption("Interactions, side effects, paths, shared effects, safer alternatives, graph stats.")
+    st.caption("Load sample graph data, then explore interactions, side effects, and visualize the network.")
     if not HAS_NEO4J:
         st.error(f"Neo4j module unavailable: {_NEO4J_ERR}")
         return
@@ -170,6 +255,7 @@ def page_drug_knowledge():
     sub = st.radio(
         "What to run",
         [
+            "Load sample graph data",
             "Check interactions (current meds vs proposed drug)",
             "Side effects for a drug",
             "Interaction path between two drugs",
@@ -180,9 +266,28 @@ def page_drug_knowledge():
         key="neo4j_sub",
     )
 
+    if "Load sample graph data" in sub:
+        st.markdown("Create a small **sample graph** in Neo4j (Drugs, SideEffects, INTERACTS_WITH, HAS_SIDE_EFFECT) so you can try the queries and visualization without running the full SIDER ETL.")
+        if st.button("Load sample graph into Neo4j", key="neo4j_seed_btn"):
+            try:
+                counts = neo4j_queries.seed_sample_graph(**conn)
+                st.success(
+                    f"Loaded sample graph: **{counts.get('drugs', 0)}** drugs, "
+                    f"**{counts.get('side_effects', 0)}** side effects, "
+                    f"**{counts.get('interactions', 0)}** interactions, "
+                    f"**{counts.get('side_effect_links', 0)}** drug–side-effect links."
+                )
+                st.caption("Try **Interaction network (neighborhood)** below to visualize the graph.")
+            except Exception as e:
+                st.error(f"Neo4j: {e}")
+
     if "Check interactions" in sub:
-        current_meds = st.text_area("Current medications (one per line or comma-separated)")
-        proposed = st.text_input("Proposed drug")
+        current_meds = st.text_area(
+            "Current medications (one per line or comma-separated)",
+            value="Aspirin",
+            key="neo4j_check_meds",
+        )
+        proposed = st.selectbox("Proposed drug", SAMPLE_DRUGS, index=0, key="neo4j_check_proposed")
         if st.button("Check interactions"):
             meds = [m.strip() for m in current_meds.replace(",", "\n").split() if m.strip()]
             if not proposed:
@@ -210,8 +315,8 @@ def page_drug_knowledge():
                 st.error(str(e))
 
     elif "Interaction path" in sub:
-        drug_a = st.text_input("Drug A", key="path_a")
-        drug_b = st.text_input("Drug B", key="path_b")
+        drug_a = st.selectbox("Drug A", SAMPLE_DRUGS, index=1, key="path_a")
+        drug_b = st.selectbox("Drug B", SAMPLE_DRUGS, index=3, key="path_b")
         max_hops = st.slider("Max hops", 1, 5, 3)
         if st.button("Find path"):
             if drug_a and drug_b:
@@ -228,8 +333,8 @@ def page_drug_knowledge():
                 st.warning("Enter both drugs.")
 
     elif "Shared side effects" in sub:
-        drug_a = st.text_input("Drug A", key="shared_a")
-        drug_b = st.text_input("Drug B", key="shared_b")
+        drug_a = st.selectbox("Drug A", SAMPLE_DRUGS, index=1, key="shared_a")
+        drug_b = st.selectbox("Drug B", SAMPLE_DRUGS, index=3, key="shared_b")
         if st.button("Find shared side effects"):
             if drug_a and drug_b:
                 try:
@@ -244,8 +349,12 @@ def page_drug_knowledge():
                 st.warning("Enter both drugs.")
 
     elif "Safer alternatives" in sub:
-        proposed = st.text_input("Proposed drug", key="alt_proposed")
-        current_meds = st.text_area("Current medications (one per line or comma-separated)", key="alt_meds")
+        proposed = st.selectbox("Proposed drug", SAMPLE_DRUGS, index=0, key="alt_proposed")
+        current_meds = st.text_area(
+            "Current medications (one per line or comma-separated)",
+            value="Aspirin",
+            key="alt_meds",
+        )
         if st.button("Find safer alternatives"):
             meds = [m.strip() for m in current_meds.replace(",", "\n").split() if m.strip()]
             if not proposed:
@@ -261,13 +370,16 @@ def page_drug_knowledge():
                     st.error(str(e))
 
     elif "Interaction network" in sub:
-        drug = st.text_input("Drug name", key="net_drug")
+        drug = st.selectbox("Drug name", SAMPLE_DRUGS, index=0, key="net_drug")
         depth = st.slider("Depth (hops)", 1, 4, 2, key="net_depth")
         if st.button("Get network"):
             if drug:
                 try:
                     net = neo4j_queries.get_interaction_network(drug, depth=depth, **conn)
                     st.write(f"Nodes: {len(net['nodes'])}, Edges: {len(net['edges'])}")
+                    if net["nodes"] or net["edges"]:
+                        st.markdown("**Graph visualization** (drag nodes to rearrange; hover edges for description)")
+                        _render_network_graph(net)
                     if net["nodes"]:
                         st.dataframe(net["nodes"], use_container_width=True)
                     if net["edges"]:
@@ -281,20 +393,79 @@ def page_drug_knowledge():
 # ── Page: Evidence & audit (MongoDB) ──────────────────────────────────────
 def page_evidence_audit():
     st.header("Evidence & audit (MongoDB)")
-    st.caption("Log safety checks and retrieve them by run_id. Optionally fetch FAERS reports by ID.")
+    st.caption("Load sample FAERS reports, log safety checks, retrieve by run_id, or fetch reports by ID.")
     if not HAS_MONGO:
         st.error(f"MongoDB module unavailable: {_MONGO_ERR}")
         return
 
     sub = st.radio(
         "Action",
-        ["Log a safety check", "Retrieve safety check by run_id", "Fetch FAERS reports by IDs"],
+        [
+            "Load sample FAERS reports",
+            "Log a safety check",
+            "Retrieve safety check by run_id",
+            "Fetch FAERS reports by IDs",
+        ],
         key="mongo_sub",
     )
 
-    if "Log a safety check" in sub:
-        patient_id = st.text_input("Patient ID", key="log_patient")
-        proposed_drug = st.text_input("Proposed drug", key="log_drug")
+    if "Load sample FAERS reports" in sub:
+        st.markdown("Fetch adverse event reports from the **openFDA** API and store them in MongoDB (raw + normalized). Use a small limit for a quick demo.")
+        limit = st.number_input(
+            "Number of reports to load",
+            min_value=10,
+            max_value=500,
+            value=25,
+            step=10,
+            key="mongo_load_limit",
+        )
+        if st.button("Load reports into MongoDB", key="mongo_load_btn"):
+            try:
+                from etl.load_faers_to_mongo import load_faers_to_mongo
+            except ImportError as e:
+                st.error(f"Could not import ETL: {e}")
+            else:
+                mongo_uri = os.getenv("MONGO_URI", "mongodb://localhost:27017")
+                db_name = os.getenv("MONGO_DB", "drug_safety")
+                with st.spinner(f"Fetching up to {limit} reports from openFDA and writing to MongoDB…"):
+                    raw_count, norm_count = load_faers_to_mongo(
+                        mongo_uri=mongo_uri,
+                        db_name=db_name,
+                        max_reports=limit,
+                        dry_run=False,
+                    )
+                st.success(f"Loaded **{raw_count}** raw and **{norm_count}** normalized reports into MongoDB.")
+                # Show a few sample IDs so user can try "Fetch FAERS reports by IDs"
+                if raw_count > 0 and HAS_MONGO:
+                    try:
+                        from pymongo import MongoClient
+                        client = MongoClient(mongo_uri)
+                        cursor = client[db_name]["faers_raw"].find({}, {"_id": 1}).limit(5)
+                        sample_ids = [str(doc["_id"]) for doc in cursor]
+                        if sample_ids:
+                            st.session_state.mongo_sample_report_ids = sample_ids
+                            st.caption("Sample report IDs to try in **Fetch FAERS reports by IDs**:")
+                            st.code(" ".join(sample_ids))
+                    except Exception:
+                        pass
+
+    elif "Log a safety check" in sub:
+        sample_patients = _get_sample_patients()
+        if sample_patients:
+            labels = [
+                f"{p.get('last_name', '')}, {p.get('first_name', '')} ({p['id'][:8]}…)"
+                for p in sample_patients
+            ]
+            choice = st.selectbox(
+                "Patient (sample)",
+                range(len(sample_patients)),
+                format_func=lambda i: labels[i],
+                key="log_patient_choice",
+            )
+            patient_id = sample_patients[choice]["id"]
+        else:
+            patient_id = st.text_input("Patient ID", key="log_patient", placeholder="Patient UUID")
+        proposed_drug = st.selectbox("Proposed drug", SAMPLE_DRUGS, index=0, key="log_drug")
         notes = st.text_area("Notes / summary (optional)", key="log_notes")
         if st.button("Log run"):
             run = {
@@ -324,7 +495,13 @@ def page_evidence_audit():
                 st.warning("Enter a run_id.")
 
     elif "Fetch FAERS" in sub:
-        ids_text = st.text_area("FAERS report IDs (safetyreportid), one per line or comma-separated")
+        default_ids = "\n".join(st.session_state.get("mongo_sample_report_ids", []))
+        ids_text = st.text_area(
+            "FAERS report IDs (safetyreportid), one per line or comma-separated",
+            value=default_ids,
+            placeholder="Paste IDs from a Qdrant search, or load reports above first.",
+            key="mongo_fetch_ids",
+        )
         raw = st.checkbox("Raw documents (else normalized)", value=True)
         if st.button("Fetch FAERS reports"):
             ids_list = [x.strip() for x in ids_text.replace(",", "\n").split() if x.strip()]
@@ -340,12 +517,134 @@ def page_evidence_audit():
                     st.error(str(e))
 
 
+# ── Page: Similar adverse events (Qdrant + MongoDB) ───────────────────────
+def page_similar_adverse_events():
+    st.header("Similar adverse events (Qdrant)")
+    st.caption("Find FAERS reports similar to a patient on a drug. Evidence is fetched from MongoDB.")
+    if not HAS_QDRANT:
+        st.error(f"Qdrant module unavailable: {_QDRANT_ERR}")
+        return
+
+    use_patient_id = st.radio(
+        "Input",
+        ["By patient ID (use PostgreSQL profile)", "By free-text summary"],
+        key="qdrant_input",
+    )
+
+    patient_summary = ""
+    if "patient ID" in use_patient_id:
+        if not HAS_PG:
+            st.warning("PostgreSQL is required to load profile by patient ID.")
+        else:
+            sample_patients = _get_sample_patients()
+            if sample_patients:
+                labels = [
+                    f"{p.get('last_name', '')}, {p.get('first_name', '')} ({p['id'][:8]}…)"
+                    for p in sample_patients
+                ]
+                choice = st.selectbox(
+                    "Patient (sample data)",
+                    range(len(sample_patients)),
+                    format_func=lambda i: labels[i],
+                    key="qdrant_patient_choice",
+                )
+                patient_id = sample_patients[choice]["id"]
+            else:
+                patient_id = st.text_input("Patient ID", key="qdrant_patient_id", placeholder="Patient UUID")
+            if patient_id:
+                try:
+                    profile = pg_queries.get_patient_profile(patient_id, db_url=_pg_url())
+                    patient_summary = _patient_summary_from_profile(profile)
+                    st.text_area("Patient summary (from PostgreSQL)", value=patient_summary, height=100, disabled=True, key="qdrant_summary_from_pg")
+                except Exception as e:
+                    st.error(f"Could not load profile: {e}")
+    else:
+        patient_summary = st.text_area(
+            "Patient summary (sample below — edit as needed)",
+            value=SAMPLE_PATIENT_SUMMARY,
+            key="qdrant_summary_free",
+            height=100,
+        )
+
+    proposed_drug = st.selectbox(
+        "Proposed drug (sample options)",
+        [d.lower() for d in SAMPLE_DRUGS],
+        index=0,
+        key="qdrant_drug",
+    )
+    top_k = st.slider("Number of similar reports", 3, 20, 5, key="qdrant_topk")
+    fetch_evidence = st.checkbox("Fetch full evidence from MongoDB for these reports", value=True, key="qdrant_fetch_evidence")
+
+    if not st.button("Find similar adverse events", key="qdrant_btn"):
+        return
+
+    if not patient_summary or not proposed_drug:
+        st.warning("Enter both a patient summary and a proposed drug.")
+        return
+
+    try:
+        results = qdrant_queries.find_similar_adverse_events(
+            patient_summary, proposed_drug, top_k=top_k
+        )
+    except Exception as e:
+        st.error(f"Qdrant: {e}")
+        return
+
+    if not results:
+        st.info("No similar adverse events found. Load FAERS into Qdrant first (see README).")
+        return
+
+    st.subheader("Similar reports (from Qdrant)")
+    display_cols = ["report_id", "similarity_score", "reactions", "outcome", "serious"]
+    rows = [{k: r.get(k) for k in display_cols if k in r} for r in results]
+    st.dataframe(rows, use_container_width=True)
+
+    if fetch_evidence and HAS_MONGO:
+        report_ids = [r.get("report_id") for r in results if r.get("report_id")]
+        if report_ids:
+            try:
+                docs = mongo_queries.get_faers_reports_by_ids(report_ids, raw=True)
+                st.subheader("Full evidence from MongoDB")
+                st.caption(f"Fetched {len(docs)} of {len(report_ids)} reports from MongoDB.")
+                for d in docs:
+                    with st.expander(f"Report {d.get('safetyreportid', d.get('_id', '?'))}"):
+                        st.json(d)
+            except Exception as e:
+                st.error(f"MongoDB: {e}")
+
+
 # ── Page: Full safety check ───────────────────────────────────────────────
 def page_full_safety_check():
     st.header("Full safety check")
-    st.caption("Pick a patient and a proposed drug. We use PostgreSQL + Neo4j and optionally log to MongoDB.")
-    patient_id = st.text_input("Patient ID")
-    proposed_drug = st.text_input("Proposed drug")
+    st.caption("Pick a patient and a proposed drug. Uses PostgreSQL → Neo4j → Qdrant (similar events) → MongoDB (evidence & audit).")
+
+    sample_patients = _get_sample_patients()
+    if sample_patients:
+        labels = [
+            f"{p.get('last_name', '')}, {p.get('first_name', '')} ({p['id'][:8]}…)"
+            for p in sample_patients
+        ]
+        choice = st.selectbox(
+            "Patient (sample data from your database)",
+            range(len(sample_patients)),
+            format_func=lambda i: labels[i],
+            key="full_check_patient_choice",
+        )
+        patient_id = sample_patients[choice]["id"]
+    else:
+        patient_id = st.text_input(
+            "Patient ID",
+            placeholder="e.g. patient UUID from PostgreSQL",
+            key="full_check_patient_id",
+        )
+
+    proposed_drug = st.selectbox(
+        "Proposed drug (sample options)",
+        SAMPLE_DRUGS,
+        index=0,
+        key="full_check_drug",
+    )
+    include_qdrant = st.checkbox("Include similar adverse events (Qdrant)", value=True)
     log_to_mongo = st.checkbox("Log this check to MongoDB (audit)", value=True)
 
     if not st.button("Run safety check"):
@@ -353,6 +652,7 @@ def page_full_safety_check():
 
     run_outputs = {}
     run_inputs = {"patient_id": patient_id, "proposed_drug": proposed_drug}
+    profile = None
 
     # 1) Patient profile and current meds (PG)
     if HAS_PG and patient_id:
@@ -388,6 +688,29 @@ def page_full_safety_check():
     elif not proposed_drug:
         st.warning("Enter a proposed drug to check interactions and side effects.")
 
+    # 3) Similar adverse events (Qdrant) and evidence from MongoDB
+    if include_qdrant and HAS_QDRANT and proposed_drug:
+        patient_summary = ""
+        if profile:
+            patient_summary = _patient_summary_from_profile(profile)
+        else:
+            patient_summary = f"Patient on proposed drug {proposed_drug}."
+        try:
+            similar = qdrant_queries.find_similar_adverse_events(
+                patient_summary, proposed_drug, top_k=5
+            )
+            run_outputs["similar_adverse_events"] = [
+                {"report_id": r.get("report_id"), "similarity_score": r.get("similarity_score"), "reactions": r.get("reactions"), "outcome": r.get("outcome")}
+                for r in similar
+            ]
+            if similar and HAS_MONGO:
+                ids = [r.get("report_id") for r in similar if r.get("report_id")]
+                if ids:
+                    evidence = mongo_queries.get_faers_reports_by_ids(ids, raw=True)
+                    run_outputs["similar_events_evidence_count"] = len(evidence)
+        except Exception as e:
+            st.error(f"Qdrant: {e}")
+
     # Show report
     st.subheader("Report")
     st.json({"inputs": run_inputs, "outputs": run_outputs})
@@ -402,7 +725,13 @@ def page_full_safety_check():
         st.subheader("Side effects (sample)")
         st.dataframe(run_outputs["side_effects_sample"], use_container_width=True)
 
-    # 3) Log to MongoDB
+    if run_outputs.get("similar_adverse_events"):
+        st.subheader("Similar adverse events (Qdrant)")
+        st.dataframe(run_outputs["similar_adverse_events"], use_container_width=True)
+        if run_outputs.get("similar_events_evidence_count") is not None:
+            st.caption(f"Fetched {run_outputs['similar_events_evidence_count']} full report(s) from MongoDB.")
+
+    # 4) Log to MongoDB
     if log_to_mongo and HAS_MONGO:
         try:
             run_id = mongo_queries.log_safety_check({"inputs": run_inputs, "outputs": run_outputs})
@@ -419,13 +748,15 @@ def main():
         layout="wide",
     )
     st.title("Drug Safety & Recommendation")
-    st.markdown("Experience what each database can do: **PostgreSQL** (patients), **Neo4j** (interactions & side effects), **MongoDB** (evidence & audit).")
+    st.markdown("Single demo: **PostgreSQL** (patients), **Neo4j** (interactions & side effects), **Qdrant** (similar adverse events), **MongoDB** (evidence & audit).")
+    st.info("**Sample data ready** — Each section starts with example patients and drugs you can run immediately. Use the dropdowns or enter your own.")
 
     page = st.sidebar.radio(
         "Section",
         [
             "Patient data (PostgreSQL)",
             "Drug knowledge (Neo4j)",
+            "Similar adverse events (Qdrant)",
             "Evidence & audit (MongoDB)",
             "Full safety check",
         ],
@@ -435,6 +766,8 @@ def main():
         page_patient_data()
     elif page == "Drug knowledge (Neo4j)":
         page_drug_knowledge()
+    elif page == "Similar adverse events (Qdrant)":
+        page_similar_adverse_events()
     elif page == "Evidence & audit (MongoDB)":
         page_evidence_audit()
     else:

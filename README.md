@@ -23,18 +23,18 @@ drug_safety_and_recommendation/
     pg_queries.py            # get_active_medications(), get_patient_profile(), get_medication_history(), get_patient_timeline(), validate_timeline_consistency()
     pg_queries.ipynb         # Notebook for exploring pg_queries
     neo4j_queries.py         # Part 2: check_interactions(), get_side_effects(), etc.
+    qdrant_queries.py        # Part 3: find_similar_adverse_events(), load_patient_profiles(), etc.
     mongo_queries.py         # Part 4: get_faers_reports_by_ids(), log_safety_check(), etc.
-    # qdrant_queries.py      # TODO part 3
   etl/
     __init__.py
     load_synthea_to_pg.py    # Load all Synthea CSVs into PostgreSQL 
     load_synthea_to_pg.ipynb # Notebook for running the ETL
     load_sider_to_neo4j.py   # Part 2: SIDER side-effect TSV → Neo4j (SideEffect, HAS_SIDE_EFFECT)
     load_faers_to_mongo.py   # Part 4: openFDA FAERS → MongoDB (raw + normalized)
+    load_faers_to_qdrant.py # Part 3: openFDA FAERS → Qdrant (embed + vector store)
     # load_rxnav_to_neo4j.py # Part 2: RxNav API → Drug nodes + INTERACTS_WITH (if implemented)
-    # load_faers_to_qdrant.py# (Part 3)
-  app/                       # Part 5 — demo and (future) orchestration
-    demo.py                  # Streamlit demo: experience all databases
+  app/                       # Part 5 — demo and orchestration
+    demo.py                  # Streamlit demo: single app for all four databases
     # config.py              # Central DB config (to be implemented)
     # drug_safety_check.py   # Main orchestration & reporting (to be implemented)
   docs/
@@ -87,8 +87,7 @@ pip install -r requirements.txt
 - `neo4j` — Neo4j driver (Part 2)
 - `pymongo`, `requests` — MongoDB and openFDA API (Part 4)
 - `streamlit` — Web demo (run `streamlit run app/demo.py`)
-
-Additional dependencies for Qdrant will be added when Part 3 is implemented.
+- `qdrant-client`, `sentence-transformers`, `numpy`, `scikit-learn`, `python-dotenv` — Part 3 (Qdrant vector search)
 
 ### 2. Databases
 
@@ -96,8 +95,8 @@ You will need running instances of:
 
 - **PostgreSQL** — Part 1 (required for patient data)
 - **Neo4j** — Part 2 (drug interactions and side effects)
+- **Qdrant** — Part 3 (vector similarity over FAERS adverse events)
 - **MongoDB** — Part 4 (FAERS evidence store and audit)
-- **Qdrant** — Part 3 (vector search; when implemented)
 
 For **PostgreSQL**, create a database `drug_safety` and ensure the connection URL matches what the code expects.
 
@@ -109,30 +108,63 @@ postgresql://postgres:postgres@localhost:5432/drug_safety
 
 You can override this via the `PG_URL` environment variable.
 
-Neo4j and MongoDB use defaults (`NEO4J_URI`, `NEO4J_USER`, `NEO4J_PASSWORD`, `MONGO_URI`, `MONGO_DB`); set these if your instances differ.
+Neo4j and MongoDB use defaults (`NEO4J_URI`, `NEO4J_USER`, `NEO4J_PASSWORD`, `MONGO_URI`, `MONGO_DB`); set these if your instances differ. Start Docker Desktop first, then proceed below.
+
+**Qdrant** (Part 3): default is Docker at `localhost:6333`. Start with:
+
+```bash
+docker compose -f qdrant/docker-compose.yml up -d
+```
+
+Then load FAERS into Qdrant (from project root):
+
+```bash
+python etl/load_faers_to_qdrant.py --limit 5000
+# or use cached openFDA data: python etl/load_faers_to_qdrant.py --use-cache
+```
+
+Use `QDRANT_HOST`, `QDRANT_PORT` if Qdrant is elsewhere; or set `QDRANT_PATH` to a directory for on-disk storage (no server).
 
 ### 3. Run the Streamlit demo
 
 From the project root (with your venv activated and databases running):
+
 Export all of your commands:
+
 ```bash
+# PostgreSQL
 export PG_URL="postgresql://postgres:<your_password>@localhost:5432/drug_safety"
+
+# Neo4j
 export NEO4J_URI="neo4j://127.0.0.1:7687"
 export NEO4J_USER="neo4j"
 export NEO4J_PASSWORD="<your_password>"
-streamlit run app/demo.py
+
+# MongoDB
+export MONGO_URI="mongodb+srv://YOUR_USER:YOUR_PASSWORD@cluster0.qizimgq.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
+export MONGO_DB="drug_safety"
 ```
+
+Load data into PostgreSQL and MongoDB first using
+
+```bash
+python etl/load_synthea_to_pg.py
+python etl/load_faers_to_mongo.py --limit 100
+```
+
+Set up Qdrant using the above commands.
 
 ```bash
 streamlit run app/demo.py
 ```
 
-The demo lets you:
+The **single demo** uses all four databases:
 
 - **Patient data (PostgreSQL)** — List patients, view profile, active medications, medication history, and timeline.
 - **Drug knowledge (Neo4j)** — Check interactions (current meds vs proposed drug), side effects, interaction paths, shared side effects, safer alternatives, and graph statistics.
+- **Similar adverse events (Qdrant)** — Find FAERS reports similar to a patient on a proposed drug; optionally **fetch full evidence from MongoDB** for those report IDs (MongoDB + vector DB together).
 - **Evidence & audit (MongoDB)** — Log safety-check runs and retrieve them by `run_id`; fetch FAERS reports by ID.
-- **Full safety check** — Enter a patient ID and proposed drug; see a combined report (profile + interactions + side effects) and optionally log the run to MongoDB.
+- **Full safety check** — Patient ID + proposed drug → PostgreSQL (profile) → Neo4j (interactions, side effects) → Qdrant (similar adverse events) → MongoDB (evidence for those events + audit log).
 
 If a database is unreachable, the app shows a clear error and continues for other sections.
 
@@ -295,6 +327,79 @@ effects = get_side_effects("Warfarin")
 
 ---
 
+## Part 3 — Qdrant (Vector Similarities over FAERS Adverse Events)
+
+Part 3 provides **vector similarity search** over adverse event reports from **openFDA FAERS**. A patient summary and proposed drug are embedded with the **BioLORD-2023** model (768-dim); Qdrant returns the most similar FAERS cases. The app then fetches full evidence for those report IDs from MongoDB (Part 4).
+
+### 1. Prerequisites
+
+- **Qdrant** running (default: `localhost:6333`). Start with Docker:
+  ```bash
+  docker compose -f qdrant/docker-compose.yml up -d
+  ```
+  Or use on-disk storage (no server): set `QDRANT_PATH` to a directory (e.g. `./qdrant_local`).
+- Optional: `OPENFDA_API_KEY` in the environment for higher openFDA rate limits when fetching FAERS.
+
+### 2. Load FAERS into Qdrant
+
+From the project root (with Qdrant running):
+
+```bash
+# Fetch from openFDA, embed, and load (default: up to 5000 reports)
+python etl/load_faers_to_qdrant.py
+
+# Use cached raw JSON (no API call; requires data/faers_raw.json from a previous run)
+python etl/load_faers_to_qdrant.py --use-cache
+
+# Limit number of reports (e.g. quick test)
+python etl/load_faers_to_qdrant.py --limit 500
+```
+
+Options:
+
+- `--limit N` — Max reports to fetch from openFDA (default: 5000).
+- `--use-cache` — Read from `data/faers_raw.json` instead of calling the API.
+- `--qdrant-host`, `--qdrant-port` — Qdrant server (default: localhost:6333).
+- `--qdrant-path PATH` — Use on-disk Qdrant at `PATH` instead of a server.
+
+The script parses and filters FAERS (keeps only reports with drugs and reactions), serializes each to text, embeds with BioLORD, and upserts into the `adverse_events` collection. Payload indexes are created for filtered search (drug, outcome, serious, patient_sex).
+
+### 3. Query Interface
+
+The Part 3 interface lives in `db/qdrant_queries.py`.
+
+
+| Function                                                                  | Purpose                                                                                        |
+| ------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| `find_similar_adverse_events(patient_summary, drug_name, top_k=10)`       | FAERS reports similar to the summary, filtered by drug; returns report_id, reactions, outcome. |
+| `find_similar_adverse_events_multi_filter(..., drug_names, outcome, ...)` | Same with optional filters (drugs, outcome, serious_only, sex).                                |
+| `find_similar_patients(patient_summary, top_k=10)`                        | Similar patient profiles (requires `load_patient_profiles()` to have been run).                |
+| `load_patient_profiles(profiles)`                                         | Embed and upsert Synthea profiles (e.g. from `get_patient_profile()`) into `patient_profiles`. |
+| `analyze_adverse_event_aspects(results)`                                  | Summarize results by severity, organ system, top reactions, outcome distribution.              |
+
+
+Use in Python:
+
+```python
+from db.qdrant_queries import find_similar_adverse_events, find_similar_patients
+
+# Similar adverse events for a patient on a proposed drug
+results = find_similar_adverse_events(
+    "65 year old male, diabetes, hypertension, on metformin",
+    "warfarin",
+    top_k=5
+)
+# Each result has report_id, similarity_score, reactions, outcome, etc.
+# Use report_id with mongo_queries.get_faers_reports_by_ids() for full evidence.
+```
+
+### 4. Environment Variables
+
+- **QDRANT_HOST**, **QDRANT_PORT** — Qdrant server (default: `localhost`, `6333`). Leave unset when using `QDRANT_PATH`.
+- **QDRANT_PATH** — Directory for on-disk Qdrant; if set, the client uses local storage instead of host/port.
+
+---
+
 ## Part 4 — MongoDB (FAERS Evidence Store & Audit Trail)
 
 Part 4 stores **openFDA FAERS** adverse-event reports and an **audit log** of safety-check runs for traceability.
@@ -310,6 +415,14 @@ Fetch reports from the openFDA Drug Event API and write raw + normalized documen
 
 ```bash
 python etl/load_faers_to_mongo.py
+```
+
+If you use **MongoDB Atlas** (as in `etl/load_faers_to_mongo.ipynb`), set `MONGO_URI` and `MONGO_DB` first, or pass `--mongo-uri` and `--db`, so the script connects to the same cluster as the notebook:
+
+```bash
+export MONGO_URI="mongodb+srv://user:password@cluster.mongodb.net/?retryWrites=true&w=majority"
+export MONGO_DB="drug_safety"
+python etl/load_faers_to_mongo.py --limit 100
 ```
 
 Options:
@@ -459,22 +572,6 @@ The result is a **single nested JSON-like structure** that summarizes the patien
 - Combined with graph and evidence data in the final safety report (Part 5).
 
 ---
-
-## Planned Parts 3 & 5 (High Level)
-
-Implementation follows the design in `PROJECT_SPLIT.md`:
-
-- **Part 3 (Qdrant + openFDA FAERS)**  
-  - Embed FAERS and/or patient summaries and store vectors in Qdrant (fed from MongoDB normalized docs).  
-  - Functions: `find_similar_adverse_events(patient_summary, drug_name, top_k)`, `find_similar_patients(patient_summary, top_k)`.
-- **Part 5 (Application & Integration)**  
-  - Central `config.py` for DB connection settings.  
-  - Main orchestrator `drug_safety_check.py` that:
-    1. Reads patient profile from PostgreSQL (Part 1)
-    2. Checks interactions and side effects via Neo4j (Part 2)
-    3. Queries Qdrant for similar FAERS cases (Part 3)
-    4. Retrieves raw evidence + logs the run in MongoDB (Part 4)
-    5. Produces a unified safety report for the user
 
 ---
 
