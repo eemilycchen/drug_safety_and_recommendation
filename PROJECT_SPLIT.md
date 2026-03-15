@@ -35,7 +35,7 @@ This document outlines how the project is divided into **5 parts**: **one part p
 |------|-------------|
 | `etl/load_synthea_to_pg.py` | Parse Synthea CSVs, bulk-load into PostgreSQL |
 | `db/pg_schema.sql` | DDL for all tables |
-| `db/pg_queries.py` | `get_active_medications()`, `get_patient_profile()` |
+| `db/pg_queries.py` | `get_active_medications()`, `get_patient_profile()`, `get_medication_history()`, `get_patient_timeline()`, `validate_timeline_consistency()`, `list_patients()` |
 
 ### Data Source
 - **Synthea** — Synthetic EHR (patients, medications, conditions, encounters, etc.)
@@ -44,11 +44,15 @@ This document outlines how the project is divided into **5 parts**: **one part p
 ```python
 def get_active_medications(patient_id: str) -> list[dict]
 def get_patient_profile(patient_id: str) -> dict
+def get_medication_history(patient_id: str, db_url=None, limit=100, years_back=None, since_date=None) -> list[dict]
+def get_patient_timeline(patient_id: str, db_url=None, since_date=None, event_types=None) -> list[dict]
+def validate_timeline_consistency(timeline_events: list[dict]) -> dict
+def list_patients(limit=20, db_url=None) -> list[dict]
 ```
 
 ### Dependencies
 - **From:** None (Part 1 is the source of patient data)
-- **To:** Part 3 needs `get_patient_profile()` for embeddings; Part 5 needs both functions
+- **To:** Part 3 needs `get_patient_profile()` for embeddings; Part 5 needs both core functions; `get_medication_history` and `get_patient_timeline` support richer context for MongoDB evidence and vector DB (Qdrant)
 
 ---
 
