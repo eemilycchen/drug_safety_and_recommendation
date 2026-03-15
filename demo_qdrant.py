@@ -19,7 +19,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-os.environ.setdefault("QDRANT_PATH", "./qdrant_local")
+os.environ.setdefault("QDRANT_PATH", "")
 
 try:
     from db.qdrant_queries import (

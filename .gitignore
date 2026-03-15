@@ -10,3 +10,7 @@ __pycache__/
 202 Final Report.pdf
 Project Example.pptx
 Project Outline.pdf
+etl/__pycache__/
+db/__pycache__/
+qdrant_local/
+qdrant_storage/

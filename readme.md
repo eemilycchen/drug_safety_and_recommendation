@@ -117,11 +117,116 @@ All of these:
 
 ---
 
+## Local vs Docker mode (Qdrant)
+
+- **Docker mode (default):** Qdrant runs in a container. Do **not** set `QDRANT_PATH`. The client uses `QDRANT_HOST` and `QDRANT_PORT` (default `localhost:6333`). All data lives inside the container.
+- **Local mode:** Qdrant runs on-disk with no server. Set `QDRANT_PATH` to a directory (e.g. `./qdrant_local`). The client uses `QdrantClient(path=...)`. Use this when you want a persistent folder and no Docker.
+
+**Important:** If you load data with Docker (e.g. `docker compose up` then run the ETL), your data is in the **Docker** instance. Tests and demos must then run **without** `QDRANT_PATH` so they connect to the same Qdrant. If `QDRANT_PATH` is set (e.g. to `./qdrant_local`), the scripts use the local folder, which is empty — so you get no results.
+
+---
+
+## Setup and run
+
+### 1. Start Qdrant
+
+- Make sure **Docker Desktop** is running (whale icon in menu bar).
+- Start the stack:
+
+```bash
+docker compose up -d
+```
+
+- Verify Qdrant is up:
+
+```bash
+curl http://localhost:6333
+```
+
+You should see something like: `{"title":"qdrant","version":"..."}`.
+
+### 2. Load data into Qdrant (STEP 4)
+
+**Option A — use cached data (fast, if `data/faers_raw.json` exists)**
+
+```bash
+python etl/load_faers_to_qdrant.py --use-cache
+```
+
+**Option B — fetch fresh from openFDA (slow, ~1 hour for 150k)**
+
+```bash
+python etl/load_faers_to_qdrant.py --limit 150000
+```
+
+**Option C — small test run (fast, good for verifying setup)**
+
+```bash
+python etl/load_faers_to_qdrant.py --limit 1000
+```
+
+**Local mode:** If you use on-disk Qdrant instead of Docker, pass the path when loading:
+
+```bash
+python etl/load_faers_to_qdrant.py --use-cache --qdrant-path ./qdrant_local
+```
+
+**Load drug profiles (needed for safe alternatives pipeline):**
+
+```bash
+python etl/load_drugs_to_qdrant.py
+```
+
+(Use `--qdrant-path ./qdrant_local` here too if you are in local mode.)
+
+### 3. Verify (STEP 5)
+
+- Check that collections exist:
+
+```bash
+curl http://localhost:6333/collections
+```
+
+- Run test queries:
+
+```bash
+python test_qdrant_queries.py
+```
+
+- Run the team demo:
+
+```bash
+python demo_qdrant.py
+```
+
+**If tests find no results:** Your data is in Docker but the test script is still using local mode.
+
+- **Fix 1 — run without `QDRANT_PATH` (use Docker):**
+
+```bash
+unset QDRANT_PATH
+python test_qdrant_queries.py
+```
+
+- **Fix 2 — change the default in `test_qdrant_queries.py`:** at the top, use:
+
+```python
+# Use Docker (no local path):
+os.environ.setdefault("QDRANT_PATH", "")
+
+# Not this (local path — empty folder when data is in Docker):
+# os.environ.setdefault("QDRANT_PATH", "./qdrant_local")
+```
+
+Same idea for `demo_qdrant.py`: either `unset QDRANT_PATH` before running, or ensure the script defaults to `QDRANT_PATH=""` so it talks to Docker.
+
+---
+
 ## Environment and Setup
 
 - **Qdrant**
-  - Default: `QDRANT_HOST=localhost`, `QDRANT_PORT=6333`.
-  - Or use a **local path** (no server): set `QDRANT_PATH` to a directory; the client uses `QdrantClient(path=...)`.
+  - **Docker:** Leave `QDRANT_PATH` unset. Uses `QDRANT_HOST=localhost`, `QDRANT_PORT=6333`.
+  - **Local (on-disk):** Set `QDRANT_PATH` to a directory; the client uses `QdrantClient(path=...)`.
 - **openFDA (ETL only)**
   - Optional: `OPENFDA_API_KEY` for higher rate limits when fetching FAERS.
 - **Python**
@@ -141,10 +246,17 @@ All of these:
 
 ## Example: Demo run
 
-Run the full demo with local Qdrant storage:
+**Docker (default):**
 
 ```bash
-QDRANT_PATH=./qdrant_local python3 demo_qdrant.py
+unset QDRANT_PATH   # optional if script already defaults to ""
+python demo_qdrant.py
+```
+
+**Local on-disk Qdrant:**
+
+```bash
+QDRANT_PATH=./qdrant_local python demo_qdrant.py
 ```
 
 The demo runs four sections:

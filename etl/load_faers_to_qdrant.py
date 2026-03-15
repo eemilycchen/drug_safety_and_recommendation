@@ -2,7 +2,7 @@
 ETL script: Fetch openFDA FAERS adverse event reports, embed them, and load into Qdrant.
 
 Integrates concepts from DSC 202 Vector Data Model lecture:
-- Dense embeddings via sentence-transformers (all-MiniLM-L6-v2, 384-dim)
+- - Dense embeddings via BioLORD-2023 (FremyCompany/BioLORD-2023, 768-dim)
 - Cosine distance for semantic similarity (normalized embeddings → cos θ = ⟨x,y⟩/(||x|| ||y||))
 - HNSW index (Qdrant default) for approximate nearest neighbor search
 - Payload indexes on filterable fields for efficient filtered search
@@ -57,15 +57,42 @@ PATIENT_PROFILES_COLLECTION = "patient_profiles"
 # ---------------------------------------------------------------------------
 # 1. Fetch FAERS data from openFDA
 # ---------------------------------------------------------------------------
+YEAR_RANGES = [
+    ("20200101", "20201231"),
+    ("20210101", "20211231"),
+    ("20220101", "20221231"),
+    ("20230101", "20231231"),
+    ("20240101", "20241231"),
+    ("20250101", "20251231"),  
+]
 
 def fetch_faers(limit: int = 5000) -> list[dict]:
-    """Paginate through the openFDA FAERS API with retry + backoff."""
-    reports = []
+    """
+    Fetch FAERS reports from openFDA.
+
+    If limit <= 25000 — single query (fast, what you use for testing)
+    If limit > 25000  — automatically slices by year to bypass
+                        openFDA's 25,000 skip hard limit.
+
+    Keeps retry + exponential backoff from original.
+    """
+    if limit <= 25000:
+        # original behaviour — single query, fast
+        return _fetch_single(limit)
+    else:
+        # year-slice mode — bypasses 25k limit
+        per_year = limit // len(YEAR_RANGES)
+        return _fetch_by_year(per_year)
+
+
+def _fetch_single(limit: int) -> list[dict]:
+    """Original single-query fetch with retry + backoff."""
+    reports  = []
     page_size = min(limit, BATCH_SIZE)
-    skip = 0
+    skip      = 0
     max_retries = 5
 
-    log.info("Fetching up to %d FAERS reports from openFDA …", limit)
+    log.info("Fetching up to %d FAERS reports (single query)…", limit)
 
     while len(reports) < limit:
         params: dict = {"limit": page_size, "skip": skip}
@@ -76,9 +103,9 @@ def fetch_faers(limit: int = 5000) -> list[dict]:
             try:
                 resp = requests.get(BASE_URL, params=params, timeout=60)
                 resp.raise_for_status()
-                break  # success — exit retry loop
+                break
             except requests.RequestException as exc:
-                wait = 2 ** attempt  # 1s, 2s, 4s, 8s, 16s
+                wait = 2 ** attempt
                 log.warning(
                     "Attempt %d/%d failed at skip=%d: %s — retrying in %ds",
                     attempt + 1, max_retries, skip, exc, wait,
@@ -96,10 +123,81 @@ def fetch_faers(limit: int = 5000) -> list[dict]:
         reports.extend(results)
         skip += page_size
         log.info("  fetched %d / %d", len(reports), limit)
-        time.sleep(0.5)  # slightly more polite between pages
+        time.sleep(0.5)
 
     log.info("Total raw reports fetched: %d", len(reports))
     return reports
+
+
+def _fetch_by_year(limit_per_year: int) -> list[dict]:
+    """Year-slice fetch — bypasses openFDA's 25,000 skip limit.
+    
+    Builds URL manually to prevent requests from encoding + as %2B
+    in the date range search syntax: receivedate:[20200101+TO+20201231]
+    """
+    all_reports = []
+    max_retries = 5
+
+    log.info(
+        "Fetching up to %d reports/year × %d years = %d total…",
+        limit_per_year, len(YEAR_RANGES), limit_per_year * len(YEAR_RANGES),
+    )
+
+    for start_date, end_date in YEAR_RANGES:
+        year    = start_date[:4]
+        reports = []
+        skip    = 0
+
+        log.info("  Year %s — fetching up to %d reports…", year, limit_per_year)
+
+        while len(reports) < limit_per_year:
+            remaining = limit_per_year - len(reports)
+            limit     = min(BATCH_SIZE, remaining)
+
+            # build URL manually — keeps + literal, not encoded as %2B
+            url = (
+                f"{BASE_URL}"
+                f"?limit={limit}"
+                f"&skip={skip}"
+                f"&search=receivedate:[{start_date}+TO+{end_date}]"
+            )
+            if API_KEY:
+                url += f"&api_key={API_KEY}"
+
+            for attempt in range(max_retries):
+                try:
+                    resp = requests.get(url, timeout=60)
+                    resp.raise_for_status()
+                    break
+                except requests.RequestException as exc:
+                    wait = 2 ** attempt
+                    log.warning(
+                        "Attempt %d/%d failed at skip=%d year=%s: %s — retrying in %ds",
+                        attempt + 1, max_retries, skip, year, exc, wait,
+                    )
+                    time.sleep(wait)
+            else:
+                log.error(
+                    "All attempts failed at skip=%d year=%s — moving to next year.",
+                    skip, year,
+                )
+                break
+
+            results = resp.json().get("results", [])
+            if not results:
+                log.info("  No more results for year %s at skip=%d", year, skip)
+                break
+
+            reports.extend(results)
+            skip += BATCH_SIZE
+            log.info("  year=%s fetched %d/%d", year, len(reports), limit_per_year)
+            time.sleep(0.4)
+
+        log.info("  Year %s done — got %d reports", year, len(reports))
+        all_reports.extend(reports)
+
+    log.info("Total fetched across all years: %d", len(all_reports))
+    return all_reports
 
 
 def save_cache(reports: list[dict]) -> None:
@@ -182,6 +280,8 @@ def parse_report(raw: dict) -> dict | None:
     outcome = ", ".join(outcome_parts)
 
     report_id = raw.get("safetyreportid", "")
+    receive_date = raw.get("receivedate", "")   # format: "20230415"
+
 
     return {
         "patient_age": age,
@@ -191,6 +291,8 @@ def parse_report(raw: dict) -> dict | None:
         "serious": serious,
         "outcome": outcome,
         "report_id": report_id,
+        "receive_date": receive_date,   
+
     }
 
 
@@ -311,6 +413,7 @@ def load_adverse_events(
             "serious": record["serious"],
             "outcome": record["outcome"],
             "report_id": record["report_id"],
+            "receive_date": record.get("receive_date", ""), 
             "raw_text": text,
         }
         points.append(PointStruct(id=i, vector=vec.tolist(), payload=payload))
@@ -328,7 +431,7 @@ def load_adverse_events(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Load openFDA FAERS data into Qdrant")
-    parser.add_argument("--limit", type=int, default=5000, help="Max reports to fetch")
+    parser.add_argument("--limit", type=int, default=150000, help="Max reports to fetch(default: 25000/year * 6 years = 150000)")
     parser.add_argument("--use-cache", action="store_true", help="Use cached JSON instead of fetching")
     parser.add_argument("--qdrant-host", default=QDRANT_HOST)
     parser.add_argument("--qdrant-port", type=int, default=QDRANT_PORT)
@@ -371,6 +474,14 @@ def main() -> None:
 
     log.info("Done. %d adverse events loaded into Qdrant.", len(records))
 
+    # log.info("Loading drug profiles for similarity pipeline...")
+    # from etl.load_drugs_to_qdrant import DRUG_CATALOG
+    # from db.qdrant_queries import load_drug_profiles
+    # n = load_drug_profiles(DRUG_CATALOG)
+    # log.info("Done. %d drug profiles loaded into 'drug_profiles'.", n)
+
 
 if __name__ == "__main__":
     main()
+
+
