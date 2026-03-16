@@ -1,4 +1,14 @@
-.venv/
 .DS_Store
-__pycache__/
+.env
 data/
+synthea/output/
+__pycache__/
+*.pyc
+202/
+202 Final Report.pdf
+Project Example.pptx
+Project Outline.pdf
+etl/__pycache__/
+db/__pycache__/
+qdrant_local/
+qdrant_storage/
