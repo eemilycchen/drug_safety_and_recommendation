@@ -311,6 +311,40 @@ def analyze_adverse_event_aspects(results: list[dict]) -> dict:
     }
 
 
+def get_drug_faers_summary(drug_name: str, top_k: int = 100) -> dict | None:
+    """Get FAERS reaction/outcome summary for a drug (for ranking or annotating alternatives).
+
+    Fetches reports involving this drug via semantic search with a generic query,
+    then runs aspect analysis. Use to compare alternatives by outcome/reaction profile.
+
+    Returns:
+        Dict with total_reports, outcome_distribution, top_reactions, severity_distribution,
+        and pct_serious (0.0–1.0, proportion of reports that are serious). None if Qdrant
+        unavailable or collection empty.
+    """
+    try:
+        generic_query = f"Patient taking {drug_name} experienced adverse reaction or side effect."
+        results = find_similar_adverse_events(generic_query, drug_name.lower(), top_k=top_k)
+        if not results:
+            return None
+        aspects = analyze_adverse_event_aspects(results)
+        n = aspects["total_reports"]
+        severity = aspects.get("severity_distribution", {})
+        high = sum(severity.get(s, 0) for s in ["high", "death", "life-threatening", "hospitalization", "disability"])
+        # severity keys we use are "high", "moderate", "low", "unknown"
+        high_count = severity.get("high", 0)
+        pct_serious = (high_count / n) if n else 0.0
+        return {
+            "total_reports": n,
+            "outcome_distribution": aspects.get("outcome_distribution", {}),
+            "top_reactions": aspects.get("top_reactions", {}),
+            "severity_distribution": severity,
+            "pct_serious": round(pct_serious, 3),
+        }
+    except Exception:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Embedding similarity utilities
 # (ref: Word2Vec.py calculate_word_similarity, FastText.py compare_partial_words)

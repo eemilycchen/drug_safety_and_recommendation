@@ -207,11 +207,11 @@ python etl/load_faers_to_qdrant.py --limit 5000
 # Use cached data (skip API calls)
 python etl/load_faers_to_qdrant.py --use-cache
 
-# Local Qdrant (no Docker needed)
-python etl/load_faers_to_qdrant.py --qdrant-path ./qdrant_local
+# Qdrant in Docker (default): ensure docker compose up -d, then run without QDRANT_PATH
+python etl/load_faers_to_qdrant.py --limit 5000
 
-# Remote Qdrant server
-python etl/load_faers_to_qdrant.py --qdrant-host localhost --qdrant-port 6333
+# On-disk Qdrant (no Docker)
+python etl/load_faers_to_qdrant.py --qdrant-path ./qdrant_local
 ```
 
 ### Environment variables
@@ -315,7 +315,8 @@ Embeds and upserts Synthea patient profiles into Qdrant. Takes the output of `pg
 An interactive terminal demo with four sections showcasing real clinical scenarios:
 
 ```bash
-QDRANT_PATH=./qdrant_local python demo_qdrant.py
+docker compose up -d    # if not already running
+python demo_qdrant.py   # uses Docker at localhost:6333 by default
 ```
 
 | Demo | What it shows |
@@ -332,7 +333,7 @@ QDRANT_PATH=./qdrant_local python demo_qdrant.py
 Sanity checks against live Qdrant data with 4 clinical test scenarios:
 
 ```bash
-QDRANT_PATH=./qdrant_local python test_qdrant_queries.py
+python test_qdrant_queries.py   # Docker default
 ```
 
 | Test | What it validates |
@@ -389,34 +390,40 @@ python analysis/embedding_analysis.py
 pip install qdrant-client sentence-transformers python-dotenv requests numpy scikit-learn matplotlib
 ```
 
-### 2. Set up environment
+### 2. Start Qdrant (Docker)
 
 ```bash
-# .env file
-OPENFDA_API_KEY=your_key_here        # optional, for higher API rate limits
-QDRANT_PATH=./qdrant_local           # local disk mode (no Docker needed)
+docker compose up -d
 ```
 
-### 3. Run the ETL
+### 3. Set up environment (optional)
 
 ```bash
-# Fetch 5000 FAERS reports, embed, and load into Qdrant
-python etl/load_faers_to_qdrant.py --limit 5000 --qdrant-path ./qdrant_local
+# .env — optional
+OPENFDA_API_KEY=your_key_here   # for higher FDA API rate limits
+# Leave QDRANT_PATH unset to use Docker (localhost:6333)
 ```
 
-### 4. Verify the data
+### 4. Run the ETL
 
 ```bash
-QDRANT_PATH=./qdrant_local python test_qdrant_queries.py
+# Fetch 5000 FAERS reports, embed, and load into Qdrant (connects to Docker)
+python etl/load_faers_to_qdrant.py --limit 5000
 ```
 
-### 5. Run the demo
+### 5. Verify the data
 
 ```bash
-QDRANT_PATH=./qdrant_local python demo_qdrant.py
+python test_qdrant_queries.py
 ```
 
-### 6. Generate analysis figures
+### 6. Run the demo
+
+```bash
+python demo_qdrant.py
+```
+
+### 7. Generate analysis figures
 
 ```bash
 python analysis/embedding_analysis.py

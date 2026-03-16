@@ -1,8 +1,6 @@
 .DS_Store
 .env
-data/faers_raw.json
-data/faers_sample_5.json
-data/qdrant_storage/
+data/
 synthea/output/
 __pycache__/
 *.pyc

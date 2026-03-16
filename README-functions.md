@@ -63,6 +63,8 @@ Qdrant query layer for the Drug Safety Check application. It provides similarity
     - Wrapper that checks `drug_profiles` exists, then returns `{ proposed_drug, candidates (from find_similar_drugs), total_found, status, message }`.  
     - Intended for Part 5: get candidates from Qdrant, then filter with Neo4j (e.g. `check_interactions`).
 
+**Separate pipeline:** `drug_alternatives.py` uses **DrugBank** (`data/drugbank_alternatives.json`) plus **NDC** fallback when &lt;10 alts; results are ranked and filtered by **BioLORD similarity ≥0.40**. It does not use `drug_profiles` or `find_similar_drugs`.
+
 ---
 
 ## `etl/load_faers_to_qdrant.py`

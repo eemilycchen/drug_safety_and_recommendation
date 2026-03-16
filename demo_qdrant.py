@@ -9,7 +9,7 @@ Shows three capabilities in a clear, story-driven way:
   3. Drug intelligence       — show BioLORD understands clinical drug relationships
 
 Run from project root:
-    QDRANT_PATH=./qdrant_local python demo_qdrant.py
+    python demo_qdrant.py   # Docker default; or QDRANT_PATH=./qdrant_local for on-disk
 
 No extra dependencies beyond what is already installed.
 """
@@ -31,7 +31,7 @@ try:
     )
 except ImportError as e:
     print(f"\nERROR: {e}")
-    print("Run from project root: QDRANT_PATH=./qdrant_local python demo_qdrant.py")
+    print("Run from project root: python demo_qdrant.py  (Docker default)")
     sys.exit(1)
 
 # ── colours for terminal output ──────────────────────────────────────────────
@@ -140,7 +140,7 @@ def demo_patient_matching():
 
         if not results:
             warn(f"No FAERS reports found for '{patient['proposed_drug']}' in current dataset.")
-            info("Try loading more reports: python etl/load_faers_to_qdrant.py --limit 10000")
+            info("Try loading more reports: python3 -m etl.load_faers_to_qdrant --limit 10000")
             continue
 
         print(f"  {GREEN}Top {len(results)} similar FAERS reports:{RESET}\n")
@@ -379,8 +379,8 @@ def main():
     print(f"  {DIM}UC San Diego · DSC 202 · Drug Safety & Recommendation{RESET}")
     print(f"\n  {DIM}Model  : FremyCompany/BioLORD-2023 (768-dim biomedical embeddings){RESET}")
     print(f"  {DIM}Data   : openFDA FAERS adverse event reports{RESET}")
-    print(f"  {DIM}Store  : Qdrant (local file mode){RESET}")
-    print(f"  {DIM}Path   : {os.environ.get('QDRANT_PATH', './qdrant_local')}{RESET}")
+    print(f"  {DIM}Store  : Qdrant (Docker default, or QDRANT_PATH for on-disk){RESET}")
+    print(f"  {DIM}Path   : {os.environ.get('QDRANT_PATH', '(none — using Docker host:port)')}{RESET}")
     sep("═")
     pause(1)
 

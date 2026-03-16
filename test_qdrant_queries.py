@@ -5,7 +5,7 @@ Quick sanity-check for your local Qdrant data.
 Calls your existing db/qdrant_queries.py functions directly.
 
 Run from your project root:
-    QDRANT_PATH=./qdrant_local python test_qdrant_queries.py
+    python test_qdrant_queries.py   # Docker default; or QDRANT_PATH=./qdrant_local
 
 No new dependencies — uses whatever you already have installed.
 """
@@ -237,7 +237,7 @@ def print_scorecard(all_scores: list[float]):
 
     if not all_scores:
         print("\n  No scores collected — your sample may not contain the test drugs.")
-        print("  Try: python etl/load_faers_to_qdrant.py --limit 5000 --use-cache")
+        print("  Try: python3 -m etl.load_faers_to_qdrant --limit 5000 --use-cache")
         return
 
     import statistics

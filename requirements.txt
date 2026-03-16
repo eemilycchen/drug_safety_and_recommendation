@@ -1,0 +1,6 @@
+qdrant-client
+sentence-transformers
+requests
+python-dotenv
+numpy
+scikit-learn

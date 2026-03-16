@@ -70,20 +70,26 @@ Payload indexes are created on the adverse‑events collection for fast filterin
 6. **Create collections** — If missing, `adverse_events` and `patient_profiles` are created (768‑dim, cosine); payload indexes are created on `adverse_events`.
 7. **Upsert** — Vectors and payloads are written to the `adverse_events` collection in batches.
 
-**Usage:**
+**Usage (from project root):**
 
 ```bash
 # Fetch from API, then embed and load (default: up to 5000 reports)
-python etl/load_faers_to_qdrant.py
+python3 -m etl.load_faers_to_qdrant
 
 # Use cached raw JSON (no API call)
-python etl/load_faers_to_qdrant.py --use-cache
+python3 -m etl.load_faers_to_qdrant --use-cache
 
 # Limit number of reports fetched
-python etl/load_faers_to_qdrant.py --limit 500
+python3 -m etl.load_faers_to_qdrant --limit 500
 
-# Local disk-backed Qdrant (no server)
-python etl/load_faers_to_qdrant.py --qdrant-path /path/to/qdrant_storage
+# Restrict to one calendar year (receivedate in [YYYY0101, YYYY1231])
+python3 -m etl.load_faers_to_qdrant --year 2022 --limit 5000
+
+# Full replace after changing serious/outcome logic (delete + recreate collection)
+python3 -m etl.load_faers_to_qdrant --use-cache --recreate
+
+# Local disk-backed Qdrant (no server; use instead of Docker)
+python3 -m etl.load_faers_to_qdrant --qdrant-path ./qdrant_local --use-cache
 ```
 
 Patient profiles are **not** loaded by this script. They are loaded via the function `load_patient_profiles()` in `db/qdrant_queries.py`, which expects a list of profile dicts (e.g. from Part 1’s `get_patient_profile()`).
@@ -128,6 +134,41 @@ All of these:
 
 ## Setup and run
 
+### Run the whole thing 
+
+From the project root (`dsc 202`). Use `python3` if your system doesn’t have `python`.
+
+```bash
+# 1) Start Qdrant (Docker)
+docker compose up -d
+
+# 2) Load FAERS into Qdrant (pick one)
+python3 -m etl.load_faers_to_qdrant --limit 5000                  # small multi-year run
+# python3 -m etl.load_faers_to_qdrant --year 2022 --limit 2000    # only 2022
+# python3 -m etl.load_faers_to_qdrant --use-cache --recreate      # reuse data/faers_raw.json, full replace
+
+# 3) Build DrugBank alternatives cache — approved drugs only (default)
+python3 -m etl.drugbank_alternatives --xml "data/full database.xml" --out data/drugbank_alternatives.json
+
+# 4) Run drug alternatives
+python3 drug_alternatives.py                  # DrugBank + NDC if <10; ranked by BioLORD ≥0.40
+# python3 drug_alternatives.py --faers        # same, but annotate/re-rank with FAERS safety (requires Qdrant adverse_events)
+
+# 5) Optional — load drug profiles for other Qdrant demos
+python3 -m etl.load_drugs_to_qdrant
+
+# 6) Verify & demo
+python3 test_qdrant_queries.py
+python3 demo_qdrant.py
+```
+
+**Quick sample for FAERS (step 2):**  
+`python3 -m etl.load_sample_openfda` loads 100 FAERS reports (and optionally NDC) in one go.
+
+**Minimal for drug alternatives only (no Qdrant):** From project root, run step 3 then step 4. Requires `data/full database.xml` (DrugBank full database).
+
+---
+
 ### 1. Start Qdrant
 
 - Make sure **Docker Desktop** is running (whale icon in menu bar).
@@ -145,41 +186,54 @@ curl http://localhost:6333
 
 You should see something like: `{"title":"qdrant","version":"..."}`.
 
-### 2. Load data into Qdrant (STEP 4)
+### 2. Load data into Qdrant (step 2 above)
 
 **Option A — use cached data (fast, if `data/faers_raw.json` exists)**
 
 ```bash
-python etl/load_faers_to_qdrant.py --use-cache
+python3 -m etl.load_faers_to_qdrant --use-cache
 ```
 
 **Option B — fetch fresh from openFDA (slow, ~1 hour for 150k)**
 
 ```bash
-python etl/load_faers_to_qdrant.py --limit 150000
+python3 -m etl.load_faers_to_qdrant --limit 150000
 ```
 
 **Option C — small test run (fast, good for verifying setup)**
 
 ```bash
-python etl/load_faers_to_qdrant.py --limit 1000
+python3 -m etl.load_faers_to_qdrant --limit 1000
 ```
 
 **Local mode:** If you use on-disk Qdrant instead of Docker, pass the path when loading:
 
 ```bash
-python etl/load_faers_to_qdrant.py --use-cache --qdrant-path ./qdrant_local
+python3 -m etl.load_faers_to_qdrant --qdrant-path ./qdrant_local --use-cache
 ```
 
-**Load drug profiles (needed for safe alternatives pipeline):**
+**Load drug profiles (optional — for other Qdrant demos):**
 
 ```bash
-python etl/load_drugs_to_qdrant.py
+python3 -m etl.load_drugs_to_qdrant
 ```
 
-(Use `--qdrant-path ./qdrant_local` here too if you are in local mode.)
+(Use `--qdrant-path ./qdrant_local` only if you use on-disk Qdrant instead of Docker.)
 
-### 3. Verify (STEP 5)
+### 3. Run drug alternatives
+
+**DrugBank first, NDC when &lt;10. Build the cache first:**
+
+```bash
+python3 -m etl.drugbank_alternatives --xml "data/full database.xml" --out data/drugbank_alternatives.json
+python3 drug_alternatives.py
+# or, with FAERS-aware annotation / safety preference:
+# python3 drug_alternatives.py --faers
+```
+
+Uses `data/drugbank_alternatives.json` (never overwritten by the script). When a drug has &lt;10 alternatives, NDC is fetched and merged; merges are stored in `data/ndc_merge.json`. Alternatives are **ranked by BioLORD similarity** and only those **≥0.40** are shown (quality gate). Rebuild DrugBank cache with `etl.drugbank_alternatives` to refresh; approved only by default (`--all` for experimental). Output shows `(DrugBank)` or `(NDC)`. With `--faers`, each alternative is also annotated with FAERS reaction/outcome summary from Qdrant and, when similarity is close, safer alternatives (lower % serious) are preferred.
+
+### 4. Verify (step 6 above)
 
 - Check that collections exist:
 
@@ -187,16 +241,16 @@ python etl/load_drugs_to_qdrant.py
 curl http://localhost:6333/collections
 ```
 
-- Run test queries:
+- Run test queries (requires adverse_events data from step 2):
 
 ```bash
-python test_qdrant_queries.py
+python3 test_qdrant_queries.py
 ```
 
-- Run the team demo:
+- Run the demo:
 
 ```bash
-python demo_qdrant.py
+python3 demo_qdrant.py
 ```
 
 **If tests find no results:** Your data is in Docker but the test script is still using local mode.
@@ -205,7 +259,7 @@ python demo_qdrant.py
 
 ```bash
 unset QDRANT_PATH
-python test_qdrant_queries.py
+python3 test_qdrant_queries.py
 ```
 
 - **Fix 2 — change the default in `test_qdrant_queries.py`:** at the top, use:

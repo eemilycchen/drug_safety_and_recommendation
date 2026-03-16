@@ -9,9 +9,11 @@ Integrates concepts from DSC 202 Vector Data Model lecture:
   (ref: lecture slide on Payload in Qdrant)
 
 Usage:
-    python etl/load_faers_to_qdrant.py                      # fetch + embed + load
-    python etl/load_faers_to_qdrant.py --use-cache           # skip fetch, use cached JSON
-    python etl/load_faers_to_qdrant.py --limit 500           # fetch only 500 reports
+    python -m etl.load_faers_to_qdrant                            # fetch + embed + load
+    python -m etl.load_faers_to_qdrant --use-cache               # skip fetch, use cached JSON
+    python -m etl.load_faers_to_qdrant --use-cache --recreate    # full replace (use after changing serious/outcome logic)
+    python -m etl.load_faers_to_qdrant --limit 500               # fetch only 500 reports
+    python -m etl.load_faers_to_qdrant --year 2022 --limit 5000  # fetch only reports with receivedate in 2022
 """
 
 import argparse
@@ -126,6 +128,78 @@ def _fetch_single(limit: int) -> list[dict]:
         time.sleep(0.5)
 
     log.info("Total raw reports fetched: %d", len(reports))
+    return reports
+
+
+def fetch_faers_for_year(year: int, limit: int = 5000) -> list[dict]:
+    """
+    Fetch FAERS reports for a single calendar year (receivedate in [YYYY0101, YYYY1231]).
+
+    Uses the same single-query pagination pattern as _fetch_single, but with a
+    receivedate search filter so you can control the year from the CLI:
+
+        python -m etl.load_faers_to_qdrant --year 2022 --limit 5000
+    """
+    year = int(year)
+    start_date = f"{year}0101"
+    end_date = f"{year}1231"
+
+    reports: list[dict] = []
+    page_size = min(limit, BATCH_SIZE)
+    skip = 0
+    max_retries = 5
+
+    log.info("Fetching up to %d FAERS reports for year %d…", limit, year)
+
+    while len(reports) < limit:
+        # Build URL manually so the '+' in receivedate:[...+TO+...] is not encoded as %2B.
+        # This matches the working behaviour in _fetch_by_year.
+        url = (
+            f"{BASE_URL}"
+            f"?limit={page_size}"
+            f"&skip={skip}"
+            f"&search=receivedate:[{start_date}+TO+{end_date}]"
+        )
+        if API_KEY:
+            url += f"&api_key={API_KEY}"
+
+        for attempt in range(max_retries):
+            try:
+                resp = requests.get(url, timeout=60)
+                resp.raise_for_status()
+                break
+            except requests.RequestException as exc:
+                wait = 2 ** attempt
+                log.warning(
+                    "Year %d: attempt %d/%d failed at skip=%d: %s — retrying in %ds",
+                    year,
+                    attempt + 1,
+                    max_retries,
+                    skip,
+                    exc,
+                    wait,
+                )
+                time.sleep(wait)
+        else:
+            log.error(
+                "Year %d: all %d attempts failed at skip=%d — stopping.",
+                year,
+                max_retries,
+                skip,
+            )
+            break
+
+        results = resp.json().get("results", [])
+        if not results:
+            log.info("Year %d: no more results at skip=%d", year, skip)
+            break
+
+        reports.extend(results)
+        skip += page_size
+        log.info("Year %d: fetched %d / %d", year, len(reports), limit)
+        time.sleep(0.5)
+
+    log.info("Year %d: total raw reports fetched: %d", year, len(reports))
     return reports
 
 
@@ -264,8 +338,6 @@ def parse_report(raw: dict) -> dict | None:
     if not drugs or not reactions:
         return None
 
-    serious = raw.get("serious") == "1"
-
     outcome_parts = []
     if raw.get("seriousnessdeath") == "1":
         outcome_parts.append("death")
@@ -278,6 +350,8 @@ def parse_report(raw: dict) -> dict | None:
     if not outcome_parts:
         outcome_parts.append("non-serious")
     outcome = ", ".join(outcome_parts)
+    # Derive serious from same flags as outcome so "non-serious" and serious: no always match
+    serious = outcome != "non-serious"
 
     report_id = raw.get("safetyreportid", "")
     receive_date = raw.get("receivedate", "")   # format: "20230415"
@@ -340,8 +414,11 @@ def serialize_report(record: dict) -> str:
 # 4. Embed and load into Qdrant
 # ---------------------------------------------------------------------------
 
-def create_collections(client: QdrantClient) -> None:
+def create_collections(client: QdrantClient, recreate_adverse_events: bool = False) -> None:
     """Create Qdrant collections with payload indexes for efficient filtered search.
+
+    If recreate_adverse_events is True, the adverse_events collection is deleted first
+    so the next load is a full replace (avoids stale payloads e.g. after serious logic changes).
 
     Design decisions (ref: DSC 202 Vector Data Model lecture):
     - Distance.COSINE: chosen because sentence-transformer embeddings are normalized,
@@ -353,6 +430,10 @@ def create_collections(client: QdrantClient) -> None:
       to narrow the candidate set before vector comparison, avoiding full-scan
       over filtered subsets (ref: lecture slide on Payload in Qdrant).
     """
+    if recreate_adverse_events and client.collection_exists(ADVERSE_EVENTS_COLLECTION):
+        client.delete_collection(ADVERSE_EVENTS_COLLECTION)
+        log.info("Deleted collection '%s' (--recreate)", ADVERSE_EVENTS_COLLECTION)
+
     for name in [ADVERSE_EVENTS_COLLECTION, PATIENT_PROFILES_COLLECTION]:
         if not client.collection_exists(name):
             client.create_collection(
@@ -431,8 +512,21 @@ def load_adverse_events(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Load openFDA FAERS data into Qdrant")
-    parser.add_argument("--limit", type=int, default=150000, help="Max reports to fetch(default: 25000/year * 6 years = 150000)")
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=150000,
+        help="Max reports to fetch (default: 25000/year * 6 years = 150000). When --year is set, this is per-year limit.",
+    )
+    parser.add_argument(
+        "--year",
+        type=int,
+        default=None,
+        help="Restrict fetch to a single calendar year (receivedate between YYYY0101 and YYYY1231). "
+             "If omitted, uses single-query (limit<=25000) or multi-year slice (limit>25000).",
+    )
     parser.add_argument("--use-cache", action="store_true", help="Use cached JSON instead of fetching")
+    parser.add_argument("--recreate", action="store_true", help="Delete adverse_events collection before load (full replace; use after changing parse logic)")
     parser.add_argument("--qdrant-host", default=QDRANT_HOST)
     parser.add_argument("--qdrant-port", type=int, default=QDRANT_PORT)
     parser.add_argument("--qdrant-path", default=os.getenv("QDRANT_PATH", ""),
@@ -443,7 +537,10 @@ def main() -> None:
     if args.use_cache and CACHE_FILE.exists():
         raw_reports = load_cache()
     else:
-        raw_reports = fetch_faers(limit=args.limit)
+        if args.year is not None:
+            raw_reports = fetch_faers_for_year(args.year, limit=args.limit)
+        else:
+            raw_reports = fetch_faers(limit=args.limit)
         if raw_reports:
             save_cache(raw_reports)
         else:
@@ -469,7 +566,7 @@ def main() -> None:
         client = QdrantClient(host=args.qdrant_host, port=args.qdrant_port)
 
     # --- Create collections & upsert ---
-    create_collections(client)
+    create_collections(client, recreate_adverse_events=args.recreate)
     load_adverse_events(client, model, records)
 
     log.info("Done. %d adverse events loaded into Qdrant.", len(records))
