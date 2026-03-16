@@ -1,0 +1,22 @@
+# Don't send git metadata / caches to Docker
+.git
+__pycache__/
+*.pyc
+
+# Runtime volumes we don't need baked into the image
+qdrant_local/
+qdrant_storage/
+neo4j_data/
+neo4j_logs/
+pg_data/
+mongo_data/
+
+# Keep secrets out of the image (share a .env.example instead)
+.env
+
+# Large local-only docs (optional)
+202 Final Report.pdf
+202 Final Project Report Copy.pdf
+Project Example.pptx
+Project Outline.pdf
+202/
