@@ -544,3 +544,191 @@ def validate_timeline_consistency(timeline_events: list[dict]) -> dict:
             else None
         ),
     }
+
+
+def list_observation_codes(
+    patient_id: str,
+    *,
+    min_readings: int = 3,
+    db_url: str | None = None,
+) -> list[dict]:
+    """
+    Return numeric observation codes for a patient that have at least
+    *min_readings* data points — suitable for trend charting.
+    """
+    sql = """
+        SELECT code, description, COUNT(*) AS readings
+        FROM observations
+        WHERE patient = %s AND type = 'numeric'
+          AND value ~ '^[0-9]+\\.?[0-9]*$'
+          AND code ~ '^[0-9]'          -- LOINC codes only (exclude DALY/QALY/QOLS etc.)
+          AND code NOT IN ('72514-3')  -- skip pain severity (too noisy / not clinical lab)
+        GROUP BY code, description
+        HAVING COUNT(*) >= %s
+        ORDER BY readings DESC
+    """
+    with _get_cursor(db_url) as cur:
+        cur.execute(sql, (patient_id, min_readings))
+        return [dict(r) for r in cur.fetchall()]
+
+
+def get_observation_trends(
+    patient_id: str,
+    obs_code: str,
+    *,
+    window: int = 3,
+    db_url: str | None = None,
+) -> list[dict]:
+    """
+    Return a time-series for one observation code with rolling-window stats
+    computed entirely in PostgreSQL using window functions.
+
+    Columns returned:
+      obs_date   – timestamp of the reading
+      value      – raw numeric value
+      rolling_avg  – average over the preceding *window* rows (inclusive)
+      rolling_min  – min over the window
+      rolling_max  – max over the window
+      change_from_prev – difference from the immediately preceding reading (LAG)
+    """
+    frame = f"ROWS BETWEEN {window - 1} PRECEDING AND CURRENT ROW"
+    sql = f"""
+        SELECT
+            obs_date,
+            units,
+            value::numeric                                                   AS value,
+            AVG(value::numeric) OVER (ORDER BY obs_date {frame})            AS rolling_avg,
+            MIN(value::numeric) OVER (ORDER BY obs_date {frame})            AS rolling_min,
+            MAX(value::numeric) OVER (ORDER BY obs_date {frame})            AS rolling_max,
+            value::numeric
+              - LAG(value::numeric) OVER (ORDER BY obs_date)                AS change_from_prev
+        FROM observations
+        WHERE patient = %s
+          AND code    = %s
+          AND type    = 'numeric'
+          AND value ~ '^[0-9]+\\.?[0-9]*$'
+        ORDER BY obs_date
+    """
+    with _get_cursor(db_url) as cur:
+        cur.execute(sql, (patient_id, obs_code))
+        rows = []
+        for r in cur.fetchall():
+            d = dict(r)
+            for key in ("value", "rolling_avg", "rolling_min", "rolling_max", "change_from_prev"):
+                if d[key] is not None:
+                    d[key] = float(d[key])
+            rows.append(d)
+        return rows
+
+
+def get_procedure_costs(
+    patient_id: str,
+    *,
+    rolling_window: int = 5,
+    db_url: str | None = None,
+) -> list[dict]:
+    """
+    Procedure cost trajectory with window functions:
+      - cumulative_cost  : running total procedure spend (UNBOUNDED PRECEDING)
+      - rolling_avg_cost : average over last *rolling_window* procedures
+      - cost_change      : difference from previous procedure (LAG)
+
+    Uses procedures.base_cost which varies meaningfully by procedure type
+    (e.g. colonoscopy ~$13k vs routine checkup ~$130).
+    """
+    sql = f"""
+        SELECT
+            proc_date::date                                                              AS proc_date,
+            description                                                                 AS procedure,
+            base_cost::numeric                                                          AS cost,
+            SUM(base_cost::numeric)
+                OVER (ORDER BY proc_date
+                      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)                AS cumulative_cost,
+            AVG(base_cost::numeric)
+                OVER (ORDER BY proc_date
+                      ROWS BETWEEN {rolling_window - 1} PRECEDING AND CURRENT ROW)    AS rolling_avg_cost,
+            base_cost::numeric
+                - LAG(base_cost::numeric) OVER (ORDER BY proc_date)                    AS cost_change
+        FROM procedures
+        WHERE patient = %s
+          AND base_cost IS NOT NULL
+        ORDER BY proc_date
+    """
+    with _get_cursor(db_url) as cur:
+        cur.execute(sql, (patient_id,))
+        rows = []
+        for r in cur.fetchall():
+            d = dict(r)
+            for key in ("cost", "cumulative_cost", "rolling_avg_cost", "cost_change"):
+                if d[key] is not None:
+                    d[key] = float(d[key])
+            rows.append(d)
+        return rows
+
+
+def get_medication_burden(
+    patient_id: str,
+    *,
+    db_url: str | None = None,
+) -> list[dict]:
+    """
+    Medication timeline with window functions:
+      - cumulative_meds : running count of medications ever started (ROW_NUMBER)
+      - days_since_last : days between consecutive prescription starts (LAG)
+    """
+    sql = """
+        SELECT
+            start_ts::date                                                  AS start_date,
+            COALESCE(stop_ts::date::text, 'Present')                        AS stop_date,
+            description                                                     AS medication,
+            reasondescription                                               AS reason,
+            ROW_NUMBER() OVER (ORDER BY start_ts)                          AS cumulative_meds,
+            (start_ts::date
+              - LAG(start_ts::date) OVER (ORDER BY start_ts))              AS days_since_last_med
+        FROM medications
+        WHERE patient = %s
+        ORDER BY start_ts
+    """
+    with _get_cursor(db_url) as cur:
+        cur.execute(sql, (patient_id,))
+        rows = []
+        for r in cur.fetchall():
+            d = dict(r)
+            if d["days_since_last_med"] is not None:
+                d["days_since_last_med"] = int(d["days_since_last_med"])
+            rows.append(d)
+        return rows
+
+
+def get_condition_accumulation(
+    patient_id: str,
+    *,
+    db_url: str | None = None,
+) -> list[dict]:
+    """
+    Condition timeline with window functions:
+      - cumulative_conditions : running count of diagnoses over time
+      - days_since_last_dx    : days between consecutive diagnoses (LAG)
+    """
+    sql = """
+        SELECT
+            start_date,
+            description                                                          AS condition,
+            stop_date,
+            COUNT(*) OVER (ORDER BY start_date
+                           ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)   AS cumulative_conditions,
+            start_date
+              - LAG(start_date) OVER (ORDER BY start_date)                     AS days_since_last_dx
+        FROM conditions
+        WHERE patient = %s
+        ORDER BY start_date
+    """
+    with _get_cursor(db_url) as cur:
+        cur.execute(sql, (patient_id,))
+        rows = []
+        for r in cur.fetchall():
+            d = dict(r)
+            if d["days_since_last_dx"] is not None:
+                d["days_since_last_dx"] = int(d["days_since_last_dx"])
+            rows.append(d)
+        return rows
