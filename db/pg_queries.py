@@ -505,7 +505,6 @@ def validate_timeline_consistency(timeline_events: list[dict]) -> dict:
         Dictionary with validation results and any issues found
     """
     issues = []
-
     if not timeline_events:
         return {"valid": True, "issues": [], "message": "Empty timeline"}
 
