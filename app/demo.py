@@ -635,7 +635,8 @@ def page_patient_data():
                     label = f"{selected['description']}{f' ({units})' if units else ''}"
 
                     df = pd.DataFrame(trends)
-                    df["obs_date"] = pd.to_datetime(df["obs_date"])
+                    # Ensure tz-aware timestamps are normalized to UTC before indexing
+                    df["obs_date"] = pd.to_datetime(df["obs_date"], utc=True)
                     df = df.set_index("obs_date")
 
                     latest = trends[-1]
@@ -694,7 +695,7 @@ def page_patient_data():
                 m4.metric("Most expensive", f"${max(costs):,.0f}")
 
                 df = pd.DataFrame(rows)
-                df["proc_date"] = pd.to_datetime(df["proc_date"])
+                df["proc_date"] = pd.to_datetime(df["proc_date"], utc=True)
                 df = df.set_index("proc_date")
 
                 st.subheader("Cumulative procedure spend over time")
@@ -731,7 +732,7 @@ def page_patient_data():
                 )
 
                 df = pd.DataFrame(rows)
-                df["start_date"] = pd.to_datetime(df["start_date"])
+                df["start_date"] = pd.to_datetime(df["start_date"], utc=True)
                 df = df.set_index("start_date")
 
                 st.subheader("Cumulative medications prescribed over time")
@@ -761,7 +762,7 @@ def page_patient_data():
                 )
 
                 df = pd.DataFrame(rows)
-                df["start_date"] = pd.to_datetime(df["start_date"])
+                df["start_date"] = pd.to_datetime(df["start_date"], utc=True)
                 df = df.set_index("start_date")
 
                 st.subheader("Chronic disease burden accumulation over time")
