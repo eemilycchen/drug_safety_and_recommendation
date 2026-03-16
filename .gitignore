@@ -18,3 +18,4 @@ neo4j_logs/
 pg_data/
 PART4_DONE.md
 PART4_TODO.md
+mongo_data/
