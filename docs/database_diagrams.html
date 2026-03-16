@@ -58,6 +58,9 @@ erDiagram
     patients ||--o{ immunizations : "has"
     patients ||--o{ careplans : "has"
     patients ||--o{ payer_transitions : "has"
+    encounters ||--o{ imaging_studies : "has"
+    encounters ||--o{ devices : "has"
+    encounters ||--o{ supplies : "has"
 
     organizations {
         uuid id PK
@@ -141,11 +144,39 @@ erDiagram
         text code
         text value
     }
+
+    imaging_studies {
+        uuid id PK
+        timestamptz study_date
+        uuid patient FK
+        uuid encounter FK
+        text bodysite_code
+        text modality_code
+    }
+
+    devices {
+        serial id PK
+        timestamptz start_ts
+        timestamptz stop_ts
+        uuid patient FK
+        uuid encounter FK
+        text code
+        text description
+    }
+
+    supplies {
+        serial id PK
+        timestamptz supply_date
+        uuid patient FK
+        uuid encounter FK
+        text code
+        text description
+    }
   </div>
 
   <h2>2. Neo4j (Graph) — Drug interactions & side effects</h2>
   <p><strong>Role:</strong> Drug–drug interactions and drug–side-effect relationships.</p>
-  <p><strong>Data sources:</strong> RxNav (interactions), SIDER (side effects). <strong>Nodes:</strong> Drug, SideEffect. <strong>Relationships:</strong> INTERACTS_WITH, HAS_SIDE_EFFECT.</p>
+  <p><strong>Data sources:</strong> DrugBank Open (interactions, ATC classes), SIDER (side effects). <strong>Nodes:</strong> Drug, SideEffect. <strong>Relationships:</strong> INTERACTS_WITH, HAS_SIDE_EFFECT.</p>
   <div class="mermaid">
 flowchart LR
     subgraph nodes["Node types"]
@@ -177,16 +208,20 @@ flowchart LR
 
   <h2>3. Qdrant (Vector) — Similar adverse events</h2>
   <p><strong>Role:</strong> Similarity search over embedded adverse event reports.</p>
-  <p><strong>Data source:</strong> openFDA FAERS (often via normalized docs from MongoDB). Each point = vector (embedding) + payload (e.g. report id, drug names).</p>
+  <p><strong>Data source:</strong> openFDA FAERS (often via normalized docs from MongoDB). Three main collections; each point = vector (embedding) + payload (e.g. report id, drug names).</p>
   <div class="mermaid">
 flowchart TB
-    subgraph Qdrant["Qdrant collection(s)"]
+    subgraph Qdrant["Qdrant collections"]
         direction TB
-        P1["Point 1: vector + payload (faers_id, drugs, ...)"]
-        P2["Point 2: vector + payload"]
-        P3["Point 3: vector + payload"]
-        P1 --- P2
-        P2 --- P3
+        subgraph AE["adverse_events"]
+            AE1["vector (BioLORD-2023, 768-dim) +\nfaers_id, drug, outcome, serious, sex"]
+        end
+        subgraph PP["patient_profiles"]
+            PP1["vector + patient_id,\nconditions[], medications[]"]
+        end
+        subgraph DP["drug_profiles"]
+            DP1["vector + name,\nclass, mechanism, side_effects[]"]
+        end
     end
 
     subgraph Input["Input"]
@@ -194,7 +229,7 @@ flowchart TB
     end
 
     Q -->|similarity search top_k nearest| Qdrant
-    Qdrant -->|returns| R["Similar FAERS report IDs + scores"]
+    Qdrant -->|returns| R["Similar FAERS reports / patients / drugs\n+ similarity scores"]
   </div>
 
   <h2>4. MongoDB (Document) — Evidence & audit</h2>
@@ -238,7 +273,7 @@ flowchart TB
   <h2>All four in one view</h2>
   <div class="mermaid">
 flowchart LR
-    subgraph PG["PostgreSQL"]
+    subgraph PG["PostgreSQL (Synthea)"]
         P[patients]
         E[encounters]
         M[medications]
@@ -246,24 +281,34 @@ flowchart LR
         P --- M
     end
 
-    subgraph N4["Neo4j"]
+    subgraph N4["Neo4j (drug graph)"]
         D[(Drug)]
         S[(SideEffect)]
         D --- S
     end
 
-    subgraph Q["Qdrant"]
-        V[Vectors]
-    end
-
-    subgraph MON["MongoDB"]
+    subgraph MON["MongoDB (evidence + audit)"]
         F[faers_raw / faers_normalized]
         A[safety_check_audit]
     end
 
+    subgraph Q["Qdrant (vectors)"]
+        AE[adverse_events]
+        PP[patient_profiles]
+        DP[drug_profiles]
+    end
+
+    subgraph APP["App (Streamlit demo)"]
+        UI["Safety report"]
+    end
+
     PG --> N4
-    N4 --> Q
-    Q --> MON
+    PG --> Q
+    MON --> Q
+    PG --> APP
+    N4 --> APP
+    Q --> APP
+    MON --> APP
   </div>
 </body>
 </html>

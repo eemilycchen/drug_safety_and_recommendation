@@ -31,6 +31,9 @@ erDiagram
     patients ||--o{ immunizations : "has"
     patients ||--o{ careplans : "has"
     patients ||--o{ payer_transitions : "has"
+    encounters ||--o{ imaging_studies : "has"
+    encounters ||--o{ devices : "has"
+    encounters ||--o{ supplies : "has"
 
     organizations {
         uuid id PK
@@ -114,6 +117,34 @@ erDiagram
         text code
         text value
     }
+
+    imaging_studies {
+        uuid id PK
+        timestamptz study_date
+        uuid patient FK
+        uuid encounter FK
+        text bodysite_code
+        text modality_code
+    }
+
+    devices {
+        serial id PK
+        timestamptz start_ts
+        timestamptz stop_ts
+        uuid patient FK
+        uuid encounter FK
+        text code
+        text description
+    }
+
+    supplies {
+        serial id PK
+        timestamptz supply_date
+        uuid patient FK
+        uuid encounter FK
+        text code
+        text description
+    }
 ```
 
 ---
@@ -122,7 +153,7 @@ erDiagram
 
 **Role:** Drug–drug interactions and drug–side-effect relationships; graph traversals for safety checks.
 
-**Data sources:** RxNav (interactions), SIDER (side effects).
+**Data sources:** DrugBank Open (interactions, ATC classes), SIDER (side effects).
 
 **Nodes:** `Drug`, `SideEffect`. **Relationships:** `INTERACTS_WITH` (Drug–Drug), `HAS_SIDE_EFFECT` (Drug→SideEffect).
 
@@ -164,17 +195,21 @@ flowchart LR
 
 **Data source:** openFDA FAERS (often via normalized docs from MongoDB).
 
-**Structure:** One or more collections; each point = vector (embedding) + payload (e.g. report id, drug names).
+**Structure:** Three main collections; each point = vector (embedding) + payload (e.g. report id, drug names).
 
 ```mermaid
 flowchart TB
-    subgraph Qdrant["Qdrant collection(s)"]
+    subgraph Qdrant["Qdrant collections"]
         direction TB
-        P1["Point 1: vector (embedding) + payload (faers_id, drugs, ...)"]
-        P2["Point 2: vector + payload"]
-        P3["Point 3: vector + payload"]
-        P1 --- P2
-        P2 --- P3
+        subgraph AE["adverse_events"]
+            AE1["vector (BioLORD-2023, 768-dim) +\nfaers_id, drug, outcome, serious, sex"]
+        end
+        subgraph PP["patient_profiles"]
+            PP1["vector + patient_id,\nconditions[], medications[]"]
+        end
+        subgraph DP["drug_profiles"]
+            DP1["vector + name,\nclass, mechanism, side_effects[]"]
+        end
     end
 
     subgraph Input["Input"]
@@ -182,7 +217,7 @@ flowchart TB
     end
 
     Q -->|similarity search<br/>e.g. top_k nearest| Qdrant
-    Qdrant -->|returns| R["Similar FAERS report IDs + scores"]
+    Qdrant -->|returns| R["Similar FAERS reports / patients / drugs\n+ similarity scores"]
 ```
 
 **Key idea:** Embeddings of FAERS report text (and/or patient context); query by vector to find “similar” real-world adverse events.
@@ -234,7 +269,7 @@ flowchart TB
 
 ```mermaid
 flowchart LR
-    subgraph PG["PostgreSQL"]
+    subgraph PG["PostgreSQL (Synthea)"]
         P[patients]
         E[encounters]
         M[medications]
@@ -242,22 +277,32 @@ flowchart LR
         P --- M
     end
 
-    subgraph N4["Neo4j"]
+    subgraph N4["Neo4j (drug graph)"]
         D[(Drug)]
         S[(SideEffect)]
         D --- S
     end
 
-    subgraph Q["Qdrant"]
-        V[Vectors]
-    end
-
-    subgraph MON["MongoDB"]
+    subgraph MON["MongoDB (evidence + audit)"]
         F[faers_raw / faers_normalized]
         A[safety_check_audit]
     end
 
+    subgraph Q["Qdrant (vectors)"]
+        AE[adverse_events]
+        PP[patient_profiles]
+        DP[drug_profiles]
+    end
+
+    subgraph APP["App (Streamlit demo)"]
+        UI["Safety report"]
+    end
+
     PG --> N4
-    N4 --> Q
-    Q --> MON
+    PG --> Q
+    MON --> Q
+    PG --> APP
+    N4 --> APP
+    Q --> APP
+    MON --> APP
 ```
