@@ -45,12 +45,29 @@ def _get_text(el, default: str = "") -> str:
 
 
 def _get_approved(groups_el) -> bool:
+    """
+    Return True if the drug is approved and not withdrawn.
+
+    DrugBank <groups> can contain values like: approved, investigational,
+    experimental, nutraceutical, withdrawn, illicit, etc.
+
+    For this project we only want drugs that are:
+      - explicitly marked as approved
+      - AND NOT marked as withdrawn
+    """
     if groups_el is None:
         return False
+
+    has_approved = False
+    is_withdrawn = False
     for g in groups_el.findall(_tag("group")):
-        if _get_text(g).lower() == "approved":
-            return True
-    return False
+        val = _get_text(g).lower()
+        if val == "approved":
+            has_approved = True
+        if val == "withdrawn":
+            is_withdrawn = True
+
+    return has_approved and not is_withdrawn
 
 
 def _atc_level4_codes(atc_codes_el) -> set[str]:

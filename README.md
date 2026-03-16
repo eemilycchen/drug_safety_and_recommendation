@@ -24,15 +24,16 @@ drug_safety_and_recommendation/
     pg_queries.ipynb         # Notebook for exploring pg_queries
     neo4j_queries.py         # Part 2: check_interactions(), get_side_effects(), etc.
     mongo_queries.py         # Part 4: get_faers_reports_by_ids(), log_safety_check(), etc.
-    # qdrant_queries.py      # TODO part 3
+    qdrant_queries.py        # Part 3: FAERS similarity search, drug similarity, FAERS summaries
   etl/
     __init__.py
     load_synthea_to_pg.py    # Load all Synthea CSVs into PostgreSQL 
     load_synthea_to_pg.ipynb # Notebook for running the ETL
     load_sider_to_neo4j.py   # Part 2: SIDER side-effect TSV → Neo4j (SideEffect, HAS_SIDE_EFFECT)
     load_faers_to_mongo.py   # Part 4: openFDA FAERS → MongoDB (raw + normalized)
-    # load_rxnav_to_neo4j.py # Part 2: RxNav API → Drug nodes + INTERACTS_WITH (if implemented)
-    # load_faers_to_qdrant.py# (Part 3)
+    load_faers_to_qdrant.py  # Part 3: openFDA FAERS → Qdrant (BioLORD embeddings)
+    drugbank_alternatives.py # Build DrugBank alternatives cache (ATC level 4, approved only)
+    openfda_alternatives.py  # NDC/Event-based alternatives + local-first lookup
   app/                       # Part 5 — demo and (future) orchestration
     demo.py                  # Streamlit demo: experience all databases
     # config.py              # Central DB config (to be implemented)
@@ -40,6 +41,10 @@ drug_safety_and_recommendation/
   docs/
     database_diagrams.md     # Mermaid diagrams for all four databases
     database_diagrams.html   # Browser-viewable version of the diagrams
+    HEALTHCARE_MULTIDB_README.md   # Detailed multi-DB overview (this README's original content)
+    readme.md                # Qdrant / FAERS ETL + query API (detailed)
+    README-qdrant.md         # Qdrant demos and usage
+    README-functions.md      # Function/ETL summary
   .gitignore
   PROJECT_SPLIT.md           # Detailed split of parts 1–5, responsibilities, contracts
   plan.md                    # High-level goals
@@ -58,7 +63,7 @@ Stores **structured EHR-like data** from Synthea: patients, encounters, medicati
 - **Neo4j**  
 Stores a **knowledge graph** of drug–drug interactions and side effects, built from **RxNav** and **SIDER**. Enables graph queries such as “does this proposed drug interact with any of the patient’s current medications?” and “what serious side effects are associated with this drug?”.
 - **Qdrant**  
-Stores **vector embeddings** of adverse event reports and/or patient profiles derived from **openFDA FAERS**. Enables similarity search such as “find FAERS cases most similar to this patient on this drug”.
+Stores **vector embeddings** of adverse event reports and/or patient profiles derived from **openFDA FAERS**, using the **BioLORD-2023** clinical sentence-transformer. Enables similarity search such as “find FAERS cases most similar to this patient on this drug”, and exposes helpers like `find_similar_adverse_events`, `analyze_adverse_event_aspects`, and `get_drug_faers_summary` (used to annotate alternatives with reaction/outcome data).
 - **MongoDB**  
 Serves as an **evidence store and audit trail**:
   - Raw FAERS JSON documents for traceability
@@ -66,6 +71,15 @@ Serves as an **evidence store and audit trail**:
   - Audit log of each safety check (inputs, outputs, data/embedding versions)
 - **Application Layer**  
 Orchestrates all four databases to produce a **unified safety report** and expose a CLI or notebook-based interface.
+
+In addition, there is a **DrugBank + NDC alternatives pipeline**:
+
+- **DrugBank full database** (XML) → `etl/drugbank_alternatives.py` builds `data/drugbank_alternatives.json` (approved drugs, same ATC level 4).
+- **openFDA NDC API** → `etl/openfda_alternatives.py` derives same-class alternatives as fallback and merges into `data/ndc_merge.json` (DrugBank cache is never overwritten).
+- **`drug_alternatives.py`** — loads DrugBank + NDC, then:
+  - Finds alternatives for test (or user-supplied) drugs.
+  - Ranks them by **BioLORD similarity** and filters to **≥ 0.40**.
+  - Optionally (`--faers`) uses Qdrant FAERS summaries to annotate each alternative with reaction/outcome information and prefer safer options when similarity is close.
 
 ---
 
@@ -80,15 +94,13 @@ source .venv/bin/activate  # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-`requirements.txt` includes:
+`requirements.txt` includes (abridged):
 
-- `psycopg2-binary` — PostgreSQL driver (Part 1)
-- `pandas` — CSV handling for ETL
+- `psycopg2-binary`, `pandas` — PostgreSQL + Synthea ETL (Part 1)
 - `neo4j` — Neo4j driver (Part 2)
 - `pymongo`, `requests` — MongoDB and openFDA API (Part 4)
+- `qdrant-client`, `sentence-transformers`, `python-dotenv`, `numpy`, `scikit-learn` — Qdrant + BioLORD (Part 3)
 - `streamlit` — Web demo (run `streamlit run app/demo.py`)
-
-Additional dependencies for Qdrant will be added when Part 3 is implemented.
 
 ### 2. Databases
 
@@ -295,6 +307,47 @@ effects = get_side_effects("Warfarin")
 
 ---
 
+## Part 3 — Qdrant (FAERS Similarity Search)
+
+Part 3 provides **semantic search over adverse event reports and patient profiles** using **Qdrant** and the **BioLORD‑2023** biomedical sentence‑transformer.
+
+- **ETL:** `etl/load_faers_to_qdrant.py`
+  - Fetches FAERS reports from the openFDA `drug/event` API (optionally per‑year with `--year`).
+  - Parses each report into structured fields: `patient_age`, `patient_sex`, `drugs`, `reactions`, `serious`, `outcome`, `report_id`.
+  - Serializes each record to a short text and embeds it with BioLORD (768‑dim).
+  - Upserts vectors + payload into the `adverse_events` collection in Qdrant, with payload indexes on `drug`, `outcome`, `serious`, `patient_sex`.
+
+- **Query layer:** `db/qdrant_queries.py`
+  - `find_similar_adverse_events(patient_summary, drug_name, top_k=10)` — FAERS reports similar to a free‑text patient summary, filtered by `drug`.
+  - `find_similar_adverse_events_multi_filter(...)` — same, but with optional filters on outcome, serious‑only, and sex.
+  - `analyze_adverse_event_aspects(results)` — summarizes severity, organ‑system distribution, and top reactions.
+  - `compute_drug_similarity(drug1, drug2)` — BioLORD cosine similarity between drug names (used as a quality gate for alternatives).
+  - `get_drug_faers_summary(drug_name, top_k=100)` — aggregates FAERS outcomes and reactions for a given drug (used to annotate alternatives in `drug_alternatives.py --faers`).
+
+- **Demos/tests:**
+  - `test_qdrant_queries.py` — sanity checks for FAERS similarity and drug–drug similarity.
+  - `demo_qdrant.py` — interactive console demo: similar patients, safety signal analysis, BioLORD drug intelligence, and a full safety check walkthrough.
+
+To run a minimal Qdrant pipeline:
+
+```bash
+# 1) Start Qdrant in Docker
+docker compose up -d
+
+# 2) Load FAERS into Qdrant (small run)
+python3 -m etl.load_faers_to_qdrant --limit 5000
+# or: python3 -m etl.load_faers_to_qdrant --year 2022 --limit 2000
+
+# 3) Sanity checks and demo
+unset QDRANT_PATH
+python3 test_qdrant_queries.py
+python3 demo_qdrant.py
+```
+
+This gives you a working `adverse_events` collection and lets you exercise the main Qdrant queries.
+
+---
+
 ## Part 4 — MongoDB (FAERS Evidence Store & Audit Trail)
 
 Part 4 stores **openFDA FAERS** adverse-event reports and an **audit log** of safety-check runs for traceability.
@@ -491,4 +544,3 @@ Together, these systems support an application that can answer:
 - *“What interactions and side effects should I be worried about?”*  
 - *“Have we seen similar real-world cases, and what happened?”*  
 - *“Exactly which data and model versions produced this recommendation?”*
-
