@@ -146,6 +146,18 @@ def detect_polypharmacy_clusters(
 
     bridges = len(proposed_connects_to) > 1
 
+    # Clusters BEFORE proposed drug bridges them (for 2-cluster visualization)
+    clusters_pre_bridge: list[list[str]] = []
+    if bridges:
+        pre_clusters: dict[str, list[str]] = {}
+        for d_low in all_drug_names_lower:
+            if d_low == proposed_lower:
+                continue
+            if d_low in parent:
+                root = find(d_low)
+                pre_clusters.setdefault(root, []).append(name_canonical.get(d_low, d_low))
+        clusters_pre_bridge = sorted(pre_clusters.values(), key=len, reverse=True)
+
     for ix in interactions:
         a_low = ix["drug_a"].lower()
         b_low = ix["drug_b"].lower()
@@ -159,6 +171,8 @@ def detect_polypharmacy_clusters(
             final_clusters.setdefault(root, []).append(name_canonical.get(d_low, d_low))
 
     cluster_list = sorted(final_clusters.values(), key=len, reverse=True)
+    if not bridges:
+        clusters_pre_bridge = cluster_list
 
     total_weight = sum(ix["weight"] for ix in interactions)
     has_major = any(ix["severity"] == "major" for ix in interactions)
@@ -176,6 +190,7 @@ def detect_polypharmacy_clusters(
         "drugs": all_drugs,
         "interactions": interactions,
         "clusters": cluster_list,
+        "clusters_pre_bridge": clusters_pre_bridge,
         "proposed_drug": proposed,
         "bridges_clusters": bridges,
         "risk_score": risk_score,
@@ -492,6 +507,39 @@ def find_interacting_group(
         driver.close()
 
 
+def find_drugs_known_severity_polypharmacy(
+    min_interactions: int = 2,
+    limit: int = 100,
+    uri: str = "bolt://127.0.0.1:7687",
+    user: str = "neo4j",
+    password: str = "password",
+) -> list[dict]:
+    """
+    Return drugs that (1) have no INTERACTS_WITH edges with severity 'unknown',
+    and (2) satisfy polypharmacy (at least min_interactions other drugs they interact with).
+    """
+    driver = get_connection(uri, user, password)
+    try:
+        with driver.session() as session:
+            result = session.run(
+                """
+                MATCH (d:Drug)-[r:INTERACTS_WITH]-(o:Drug)
+                WITH d.name AS drug_name, collect(r) AS rels
+                WHERE size(rels) >= $min_interactions
+                  AND all(r IN rels WHERE r.severity IS NOT NULL
+                      AND toLower(trim(toString(r.severity))) <> 'unknown')
+                RETURN drug_name, size(rels) AS interaction_count
+                ORDER BY interaction_count DESC
+                LIMIT $limit
+                """,
+                min_interactions=min_interactions,
+                limit=limit,
+            )
+            return [dict(rec) for rec in result]
+    finally:
+        driver.close()
+
+
 # ---------------------------------------------------------------------------
 # CLI for testing
 # ---------------------------------------------------------------------------
@@ -509,23 +557,27 @@ if __name__ == "__main__":
         help="Comma-separated current medications (leave blank to auto-discover)",
     )
     parser.add_argument("--alt-drug", default="", help="Second drug for path/shared queries")
+    parser.add_argument(
+        "--known-severity-polypharmacy",
+        action="store_true",
+        help="List drugs with no unknown edges that satisfy polypharmacy (min 2 interactions)",
+    )
+    parser.add_argument("--known-severity-limit", type=int, default=50)
     args = parser.parse_args()
+
+    conn = {"uri": args.uri, "user": args.user, "password": args.password}
+
+    if args.known_severity_polypharmacy:
+        print("\n=== Drugs with known severity only (no unknown edges), polypharmacy ===\n")
+        rows = find_drugs_known_severity_polypharmacy(
+            min_interactions=2, limit=args.known_severity_limit, **conn
+        )
+        for r in rows:
+            print(f"  {r['drug_name']}: {r['interaction_count']} interactions")
+        print(f"\nTotal: {len(rows)} drugs")
+        exit(0)
 
     current = [m.strip() for m in args.current_meds.split(",") if m.strip()]
-    conn = {"uri": args.uri, "user": args.user, "password": args.password}
-
-    # 1. Graph stats
-    print("\n--- Graph Statistics ---")
-    stats = get_drug_stats(**conn)
-    for k, v in stats.items():
-        print(f"  {k}: {v}")
-
-    # 2. Interactions
-    print(f"\n--- Interactions: {current} vs {args.drug} ---")
-    interactions = check_interactions(current, args.drug, **conn)
-    args = parser.parse_args()
-
-    conn = {"uri": args.uri, "user": args.user, "password": args.password}
 
     # --- 0. Graph stats ---
     print("\n=== Graph Statistics ===")
