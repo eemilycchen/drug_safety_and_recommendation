@@ -1,6 +1,20 @@
+# Part 1: PostgreSQL / Synthea
+psycopg2-binary
+pandas
+
+# Part 2: Neo4j graph
+neo4j>=5.0
+
+# Part 3: MongoDB
+pymongo>=4.0
+requests>=2.28
+
+# Part 4: Qdrant / Vector DB + BioLORD
 qdrant-client
 sentence-transformers
-requests
 python-dotenv
 numpy
 scikit-learn
+
+# Demo app (Streamlit)
+streamlit>=1.28

@@ -294,7 +294,20 @@ def load_cache() -> list[dict]:
 
 def parse_report(raw: dict) -> dict | None:
     """Extract structured fields from a single FAERS report.
-    Returns None if critical fields are missing."""
+    Returns None if critical fields are missing.
+
+    Notes on drugcharacterization:
+    - "1" = suspect drug      ← likely caused the reaction
+    - "2" = concomitant drug  ← present but not suspected
+    - "3" = interacting drug  ← interacted with suspect drug
+
+    We keep ALL drug names in `drugs` / `all_drugs`, but we also compute a
+    `primary_drug` field that prefers characterization "1". This is what we
+    index as the main `drug` payload in Qdrant so queries like
+    find_similar_adverse_events(..., drug_name="ibuprofen") only match
+    reports where ibuprofen was a suspect (or, if no suspects are recorded,
+    fall back to the first listed drug).
+    """
 
     patient = raw.get("patient", {})
 
@@ -319,13 +332,22 @@ def parse_report(raw: dict) -> dict | None:
     sex_map = {"1": "male", "2": "female"}
     sex = sex_map.get(str(sex_code))
 
-    drugs = []
-    for d in patient.get("drug", []):
+    drugs_raw = patient.get("drug", []) or []
+
+    # All drugs (generic_name if available, else medicinalproduct)
+    drugs: list[str] = []
+    drug_names_for_primary: list[tuple[dict, str]] = []  # (raw_drug, name_lower)
+    for d in drugs_raw:
         names = d.get("openfda", {}).get("generic_name", [])
         if names:
-            drugs.append(names[0].lower())
+            name = names[0].lower()
         elif d.get("medicinalproduct"):
-            drugs.append(d["medicinalproduct"].lower())
+            name = d["medicinalproduct"].lower()
+        else:
+            continue
+        drugs.append(name)
+        drug_names_for_primary.append((d, name))
+
     drugs = list(dict.fromkeys(drugs))  # deduplicate, preserve order
 
     reactions = []
@@ -337,6 +359,15 @@ def parse_report(raw: dict) -> dict | None:
 
     if not drugs or not reactions:
         return None
+
+    # Choose primary_drug: prefer suspect drugs (drugcharacterization == "1")
+    primary_drug = None
+    for d, name in drug_names_for_primary:
+        if str(d.get("drugcharacterization", "")) == "1":
+            primary_drug = name
+            break
+    if primary_drug is None and drugs:
+        primary_drug = drugs[0]
 
     outcome_parts = []
     if raw.get("seriousnessdeath") == "1":
@@ -361,12 +392,12 @@ def parse_report(raw: dict) -> dict | None:
         "patient_age": age,
         "patient_sex": sex,
         "drugs": drugs,
+        "primary_drug": primary_drug,
         "reactions": reactions,
         "serious": serious,
         "outcome": outcome,
         "report_id": report_id,
-        "receive_date": receive_date,   
-
+        "receive_date": receive_date,
     }
 
 
@@ -484,7 +515,7 @@ def load_adverse_events(
 
     points = []
     for i, (record, vec, text) in enumerate(zip(records, vectors, texts)):
-        primary_drug = record["drugs"][0] if record["drugs"] else ""
+        primary_drug = record.get("primary_drug") or (record["drugs"][0] if record["drugs"] else "")
         payload = {
             "drug": primary_drug,
             "all_drugs": record["drugs"],

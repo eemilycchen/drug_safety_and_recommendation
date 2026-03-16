@@ -125,6 +125,7 @@ def find_similar_adverse_events(
             "reactions": payload.get("reactions", []),
             "outcome": payload.get("outcome", ""),
             "serious": payload.get("serious", False),
+            "report_id": payload.get("report_id", ""),
             "similarity_score": round(hit.score, 4),
             "raw_text": payload.get("raw_text", ""),
         })
@@ -195,6 +196,7 @@ def find_similar_adverse_events_multi_filter(
             "reactions": (hit.payload or {}).get("reactions", []),
             "outcome": (hit.payload or {}).get("outcome", ""),
             "serious": (hit.payload or {}).get("serious", False),
+            "report_id": (hit.payload or {}).get("report_id", ""),
             "similarity_score": round(hit.score, 4),
             "raw_text": (hit.payload or {}).get("raw_text", ""),
         }
