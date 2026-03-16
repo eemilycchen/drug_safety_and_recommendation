@@ -113,8 +113,54 @@ def get_safety_check(
     doc = db[AUDIT_COLLECTION].find_one({"_id": run_id})
     if doc is None:
         return None
-    # _id is ObjectId or str; return as plain dict, convert ObjectId for JSON
     out = dict(doc)
     if hasattr(out.get("_id"), "binary"):
         out["_id"] = str(out["_id"])
     return out
+
+
+def search_safety_checks_by_patient(
+    name: str,
+    limit: int = 20,
+    mongo_uri: str | None = None,
+    db_name: str | None = None,
+) -> list[dict]:
+    """Return audit records whose patient_name contains *name* (case-insensitive)."""
+    db = _get_db(mongo_uri, db_name)
+    query = {"inputs.patient_name": {"$regex": name.strip(), "$options": "i"}}
+    docs = list(db[AUDIT_COLLECTION].find(query).sort("timestamp", -1).limit(limit))
+    out = []
+    for doc in docs:
+        d = dict(doc)
+        if hasattr(d.get("_id"), "binary"):
+            d["_id"] = str(d["_id"])
+        out.append(d)
+    return out
+
+
+def list_safety_checks(
+    limit: int = 20,
+    mongo_uri: str | None = None,
+    db_name: str | None = None,
+) -> list[dict]:
+    """Return the most recent safety-check audit records (newest first)."""
+    db = _get_db(mongo_uri, db_name)
+    docs = list(db[AUDIT_COLLECTION].find().sort("timestamp", -1).limit(limit))
+    out = []
+    for doc in docs:
+        d = dict(doc)
+        if hasattr(d.get("_id"), "binary"):
+            d["_id"] = str(d["_id"])
+        out.append(d)
+    return out
+
+
+def sample_faers_ids(
+    limit: int = 5,
+    mongo_uri: str | None = None,
+    db_name: str | None = None,
+) -> list[str]:
+    """Return a random sample of safetyreportid strings from faers_raw."""
+    db = _get_db(mongo_uri, db_name)
+    docs = list(db["faers_raw"].aggregate([{"$sample": {"size": limit}}]))
+    return [str(d["_id"]) for d in docs]

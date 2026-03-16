@@ -37,16 +37,26 @@ except ImportError:
 OPENFDA_BASE = "https://api.fda.gov/drug/event.json"
 DEFAULT_MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 DEFAULT_DB_NAME = os.getenv("MONGO_DB", "drug_safety")
-DEFAULT_LIMIT = 1000  # openFDA max per request
+DEFAULT_LIMIT = 1000  # openFDA max per request with API key (100 without)
 DEFAULT_SKIP = 0
 # Rate limit: openFDA asks for max 240 requests per minute (4 per second)
 REQUEST_DELAY_SEC = 0.35
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+OPENFDA_API_KEY = os.getenv("OPENFDA_API_KEY", "")
 
 
 def _fetch_page(search: str | None, limit: int, skip: int) -> dict[str, Any]:
     params: dict[str, str | int] = {"limit": limit, "skip": skip}
     if search:
         params["search"] = search
+    if OPENFDA_API_KEY:
+        params["api_key"] = OPENFDA_API_KEY
     r = requests.get(OPENFDA_BASE, params=params, timeout=60)
     r.raise_for_status()
     return r.json()
