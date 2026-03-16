@@ -12,3 +12,9 @@ etl/__pycache__/
 db/__pycache__/
 qdrant_local/
 qdrant_storage/
+neo4j_data/
+neo4j_logs/
+pg_data/
+PART4_DONE.md
+PART4_TODO.md
+mongo_data/
