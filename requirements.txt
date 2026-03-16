@@ -18,3 +18,4 @@ scikit-learn
 
 # Demo app (Streamlit)
 streamlit>=1.28
+streamlit-agraph>=0.0.45
