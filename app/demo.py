@@ -19,6 +19,39 @@ if __name__ == "__main__" or "streamlit" in sys.modules:
 import streamlit as st
 from streamlit_agraph import agraph, Node, Edge, Config
 
+
+# ── Small helpers for readable patient-facing UI ──────────────────────────────
+
+def _clean_name(name: str) -> str:
+    """Strip Synthea's numeric suffixes from generated names (e.g. Cyril535 → Cyril)."""
+    import re
+    return re.sub(r"\d+$", "", (name or "").strip())
+
+
+def _age_from_birthdate(birthdate) -> str:
+    """Return age in years from a date or ISO string (or '—' if unknown)."""
+    from datetime import date
+    if not birthdate:
+        return "—"
+    try:
+        if hasattr(birthdate, "year"):
+            bd = birthdate
+        else:
+            bd = date.fromisoformat(str(birthdate))
+        today = date.today()
+        years = today.year - bd.year - ((today.month, today.day) < (bd.month, bd.day))
+        return str(years)
+    except Exception:
+        return "—"
+
+
+def _fmt_date_only(val) -> str:
+    """Return YYYY-MM-DD from a date/datetime/str, or empty string."""
+    if not val:
+        return ""
+    s = str(val)
+    return s[:10]
+
 try:
     from db import pg_queries
     HAS_PG = True
@@ -411,8 +444,8 @@ def _render_legend():
 # ── Page: Patient data (PostgreSQL) ───────────────────────────────────────
 
 def page_patient_data():
-    st.header("Patient Data (PostgreSQL)")
-    st.caption("Synthea EHR data: demographics, medications, conditions, timeline.")
+    st.header("Patient data (PostgreSQL)")
+    st.caption("Synthea EHR-like data: demographics, medications, conditions, allergies, timeline, analytics.")
     if not HAS_PG:
         st.error(f"PostgreSQL module unavailable: {_PG_ERR}")
         return
@@ -429,26 +462,90 @@ def page_patient_data():
         return
 
     ids = [p["id"] for p in patients]
-    labels = [f"{p.get('last_name','')}, {p.get('first_name','')} ({p['id'][:8]}...)" for p in patients]
+    # Human-friendly labels without raw UUIDs
+    labels = []
+    for p in patients:
+        first = _clean_name(p.get("first_name", ""))
+        last = _clean_name(p.get("last_name", ""))
+        gender = p.get("gender", "") or "?"
+        age = _age_from_birthdate(p.get("birthdate"))
+        label = f"{first} {last} — {gender}, age {age}"
+        labels.append(label)
     choice = st.selectbox("Select a patient", range(len(ids)), format_func=lambda i: labels[i])
     patient_id = ids[choice]
 
-    tab_profile, tab_meds, tab_history, tab_timeline = st.tabs([
-        "Profile", "Active medications", "Medication history", "Timeline",
-    ])
+    tab_profile, tab_meds, tab_history, tab_timeline, tab_analytics = st.tabs(
+        ["Profile", "Active medications", "Medication history", "Timeline", "Analytics"]
+    )
 
     with tab_profile:
         try:
             profile = pg_queries.get_patient_profile(patient_id, db_url=_pg_url())
             p = profile["patient"]
-            col1, col2 = st.columns(2)
-            with col1:
-                st.metric("Name", f"{p.get('first_name','')} {p.get('last_name','')}")
-                st.metric("Gender", p.get("gender", ""))
-            with col2:
-                st.metric("Birthdate", str(p.get("birthdate", "")))
-            st.subheader("Active conditions")
-            st.dataframe(profile.get("conditions") or [{"message": "None"}], use_container_width=True)
+            first = _clean_name(p.get("first_name", ""))
+            last = _clean_name(p.get("last_name", ""))
+
+            st.subheader(f"{first} {last}")
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Date of birth", _fmt_date_only(p.get("birthdate")))
+            c2.metric("Age", _age_from_birthdate(p.get("birthdate")))
+            gender = p.get("gender")
+            gender_label = "Male" if gender == "M" else "Female" if gender == "F" else (gender or "—")
+            c3.metric("Gender", gender_label)
+
+            st.markdown("### Conditions & allergies")
+            col_left, col_right = st.columns(2)
+
+            with col_left:
+                st.caption("Active conditions")
+                conds = profile.get("conditions") or []
+                if conds:
+                    st.dataframe(
+                        [
+                            {
+                                "Condition": c.get("description") or c.get("code", ""),
+                                "Since": _fmt_date_only(c.get("start_date")),
+                            }
+                            for c in conds
+                        ],
+                        use_container_width=True,
+                    )
+                else:
+                    st.info("No active conditions.")
+
+            with col_right:
+                st.caption("Allergies")
+                allergies = profile.get("allergies") or []
+                if allergies:
+                    st.dataframe(
+                        [
+                            {
+                                "Allergy": a.get("description") or a.get("code", ""),
+                                "Since": _fmt_date_only(a.get("start_date")),
+                            }
+                            for a in allergies
+                        ],
+                        use_container_width=True,
+                    )
+                else:
+                    st.info("No known allergies.")
+
+            st.markdown("### Recent observations (last 20)")
+            obs = profile.get("recent_observations") or []
+            if obs:
+                st.dataframe(
+                    [
+                        {
+                            "Observation": o.get("description") or o.get("code", ""),
+                            "Value": f"{o.get('value','')} {o.get('units','')}".strip(),
+                            "Date": _fmt_date_only(o.get("obs_date")),
+                        }
+                        for o in obs
+                    ],
+                    use_container_width=True,
+                )
+            else:
+                st.info("No recent observations.")
         except Exception as e:
             st.error(str(e))
 
@@ -480,6 +577,199 @@ def page_patient_data():
             st.dataframe(timeline if timeline else [{"message": "No events"}], use_container_width=True)
         except Exception as e:
             st.error(str(e))
+
+    # ── Analytics tab: rolling/window metrics in PostgreSQL ─────────────────
+    with tab_analytics:
+        import pandas as pd
+
+        st.caption(
+            "PostgreSQL window functions on this patient's data — rolling lab trends, "
+            "procedure costs, medication burden, and condition accumulation."
+        )
+
+        section = st.radio(
+            "Analytics view",
+            ["Lab trends", "Procedure costs", "Medication burden", "Condition accumulation"],
+            horizontal=True,
+            key="analytics_section",
+        )
+        st.divider()
+
+        # Lab trends
+        if section == "Lab trends":
+            try:
+                obs_codes = pg_queries.list_observation_codes(patient_id, min_readings=3, db_url=_pg_url())
+            except Exception as e:
+                st.error(str(e))
+                obs_codes = []
+
+            if not obs_codes:
+                st.info(
+                    "No repeated numeric lab observations found for this patient. "
+                    "Try a data-rich patient such as Lola Abernathy or Laine Abbott."
+                )
+            else:
+                col_sel, col_win = st.columns([3, 1])
+                code_labels = [f"{c['description']} ({c['readings']} readings)" for c in obs_codes]
+                idx = col_sel.selectbox(
+                    "Lab measure",
+                    range(len(obs_codes)),
+                    format_func=lambda i: code_labels[i],
+                    key="lab_trend_code",
+                )
+                window = col_win.number_input(
+                    "Rolling window (points)", min_value=2, max_value=10, value=3, key="lab_trend_window"
+                )
+
+                selected = obs_codes[idx]
+                try:
+                    trends = pg_queries.get_observation_trends(
+                        patient_id, selected["code"], window=window, db_url=_pg_url()
+                    )
+                except Exception as e:
+                    st.error(str(e))
+                    trends = []
+
+                if trends:
+                    units = trends[0].get("units") or ""
+                    label = f"{selected['description']}{f' ({units})' if units else ''}"
+
+                    df = pd.DataFrame(trends)
+                    df["obs_date"] = pd.to_datetime(df["obs_date"])
+                    df = df.set_index("obs_date")
+
+                    latest = trends[-1]
+                    m1, m2, m3, m4 = st.columns(4)
+                    m1.metric("Latest value", f"{latest['value']:.2f}" + (f" {units}" if units else ""))
+                    m2.metric(
+                        f"Rolling avg (n={window})",
+                        f"{latest['rolling_avg']:.2f}" if latest["rolling_avg"] is not None else "—",
+                    )
+                    m3.metric(
+                        "Min (window)",
+                        f"{latest['rolling_min']:.2f}" if latest["rolling_min"] is not None else "—",
+                    )
+                    m4.metric(
+                        "Max (window)",
+                        f"{latest['rolling_max']:.2f}" if latest["rolling_max"] is not None else "—",
+                    )
+
+                    st.subheader(label)
+                    st.line_chart(
+                        df[["value", "rolling_avg"]].rename(
+                            columns={"value": "Raw value", "rolling_avg": f"Rolling avg (n={window})"}
+                        )
+                    )
+
+                    st.subheader("Change from previous reading")
+                    st.bar_chart(
+                        df[["change_from_prev"]]
+                        .dropna()
+                        .rename(columns={"change_from_prev": "Δ value"})
+                    )
+
+        # Procedure costs
+        elif section == "Procedure costs":
+            win_c = st.number_input(
+                "Rolling window (procedures)", min_value=2, max_value=20, value=5, key="proc_cost_window"
+            )
+            try:
+                rows = pg_queries.get_procedure_costs(patient_id, rolling_window=win_c, db_url=_pg_url())
+            except Exception as e:
+                st.error(str(e))
+                rows = []
+
+            if not rows:
+                st.info("No procedure records for this patient.")
+            else:
+                last = rows[-1]
+                costs = [r["cost"] for r in rows]
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Total procedure spend", f"${last['cumulative_cost']:,.0f}")
+                m2.metric(
+                    f"Rolling avg (n={win_c})",
+                    f"${last['rolling_avg_cost']:,.0f}" if last["rolling_avg_cost"] is not None else "—",
+                )
+                m3.metric("Procedures", len(rows))
+                m4.metric("Most expensive", f"${max(costs):,.0f}")
+
+                df = pd.DataFrame(rows)
+                df["proc_date"] = pd.to_datetime(df["proc_date"])
+                df = df.set_index("proc_date")
+
+                st.subheader("Cumulative procedure spend over time")
+                st.area_chart(
+                    df[["cumulative_cost"]].rename(columns={"cumulative_cost": "Cumulative spend ($)"})
+                )
+
+                st.subheader(f"Per-procedure cost vs rolling average (n={win_c})")
+                st.line_chart(
+                    df[["cost", "rolling_avg_cost"]].rename(
+                        columns={"cost": "Procedure cost ($)", "rolling_avg_cost": "Rolling avg ($)"}
+                    )
+                )
+
+        # Medication burden
+        elif section == "Medication burden":
+            try:
+                rows = pg_queries.get_medication_burden(patient_id, db_url=_pg_url())
+            except Exception as e:
+                st.error(str(e))
+                rows = []
+
+            if not rows:
+                st.info("No medication data for this patient.")
+            else:
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Total medications", rows[-1]["cumulative_meds"])
+                active = sum(1 for r in rows if r["stop_date"] == "Present")
+                m2.metric("Currently active", active)
+                gaps = [r["days_since_last_med"] for r in rows if r["days_since_last_med"] is not None]
+                m3.metric(
+                    "Avg days between prescriptions",
+                    f"{sum(gaps)//len(gaps)}" if gaps else "—",
+                )
+
+                df = pd.DataFrame(rows)
+                df["start_date"] = pd.to_datetime(df["start_date"])
+                df = df.set_index("start_date")
+
+                st.subheader("Cumulative medications prescribed over time")
+                st.line_chart(
+                    df[["cumulative_meds"]].rename(columns={"cumulative_meds": "Medications (cumulative)"})
+                )
+
+        # Condition accumulation
+        elif section == "Condition accumulation":
+            try:
+                rows = pg_queries.get_condition_accumulation(patient_id, db_url=_pg_url())
+            except Exception as e:
+                st.error(str(e))
+                rows = []
+
+            if not rows:
+                st.info("No condition data for this patient.")
+            else:
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Total diagnoses", rows[-1]["cumulative_conditions"])
+                still_active = sum(1 for r in rows if not r.get("stop_date"))
+                m2.metric("Still active", still_active)
+                gaps = [r["days_since_last_dx"] for r in rows if r["days_since_last_dx"] is not None]
+                m3.metric(
+                    "Avg days between diagnoses",
+                    f"{sum(gaps)//len(gaps)}" if gaps else "—",
+                )
+
+                df = pd.DataFrame(rows)
+                df["start_date"] = pd.to_datetime(df["start_date"])
+                df = df.set_index("start_date")
+
+                st.subheader("Chronic disease burden accumulation over time")
+                st.area_chart(
+                    df[["cumulative_conditions"]].rename(
+                        columns={"cumulative_conditions": "Diagnoses (cumulative)"}
+                    )
+                )
 
 
 # ── Page: Drug Knowledge (Neo4j) ─────────────────────────────────────────
@@ -1012,102 +1302,219 @@ def page_qdrant_and_alternatives():
 
 # ── Page: Evidence & audit (MongoDB) ──────────────────────────────────────
 def page_evidence_audit():
-    st.header("Evidence & Audit (MongoDB)")
+    st.header("Evidence & audit (MongoDB)")
+    st.caption(
+        "201,000 FAERS adverse-event reports (raw + normalised). "
+        "Use this page to browse evidence and to log/review safety-check runs."
+    )
     if not HAS_MONGO:
         st.error(f"MongoDB module unavailable: {_MONGO_ERR}")
         return
 
-    sub = st.radio(
-        "Action",
-        ["Log a safety check", "Retrieve by run_id", "Fetch FAERS reports"],
-        key="mongo_sub",
-        horizontal=True,
-    )
+    tab_faers, tab_audit = st.tabs(["FAERS evidence", "Audit log"])
 
-    if "Log" in sub:
-        patient_id = st.text_input("Patient ID", key="log_patient")
-        proposed_drug = st.text_input("Proposed drug", key="log_drug")
-        notes = st.text_area("Notes", key="log_notes")
-        if st.button("Log"):
-            try:
-                run_id = mongo_queries.log_safety_check({
-                    "inputs": {"patient_id": patient_id, "proposed_drug": proposed_drug},
-                    "outputs": {}, "notes": notes,
-                })
-                st.success(f"Logged. Run ID: `{run_id}`")
-            except Exception as e:
-                st.error(str(e))
+    # ── FAERS evidence tab ────────────────────────────────────────────────
+    with tab_faers:
+        from db import mongo_queries as _mq  # local alias
 
-    elif "Retrieve" in sub:
-        run_id = st.text_input("Run ID")
-        if st.button("Retrieve"):
-            if run_id:
+        st.markdown(
+            "Browse adverse-event reports from the **FDA FAERS** database. "
+            "Reports are stored as raw JSON (openFDA shape) and as a normalised summary."
+        )
+
+        # Pre-populate with a handful of known-good IDs
+        demo_ids = ["5801206-7", "10003300", "10003301", "10003304", "10003305"]
+        ids_text = st.text_area(
+            "Report IDs (safetyreportid) — one per line or comma-separated",
+            value="\n".join(demo_ids),
+            height=120,
+        )
+
+        col_l, col_r = st.columns([3, 1])
+        with col_l:
+            view_mode = st.radio(
+                "View mode",
+                ["Normalised (summary)", "Raw (full API document)"],
+                horizontal=True,
+                key="faers_mode",
+            )
+        with col_r:
+            st.write("")
+            if st.button("Load 5 random IDs"):
                 try:
-                    doc = mongo_queries.get_safety_check(run_id)
-                    if doc:
-                        st.subheader("Safety check summary")
-                        summary = {
-                            "run_id": str(doc.get("_id", "")),
-                            "patient_id": doc.get("inputs", {}).get("patient_id"),
-                            "proposed_drug": doc.get("inputs", {}).get("proposed_drug"),
-                            "created_at": doc.get("created_at", doc.get("timestamp")),
-                        }
-                        st.table([summary])
-
-                        with st.expander("Full details"):
-                            st.json(doc)
-                    else:
-                        st.warning("No record found for this run_id.")
+                    sample = _mq.sample_faers_ids(limit=5)
+                    st.code("\n".join(sample))
                 except Exception as e:
                     st.error(str(e))
-            else:
-                st.warning("Enter a run_id.")
-            try:
-                doc = mongo_queries.get_safety_check(run_id)
-                st.json(doc) if doc else st.warning("Not found.")
-            except Exception as e:
-                st.error(str(e))
 
-    elif "FAERS" in sub:
-        ids_text = st.text_area("FAERS report IDs (comma-separated)")
-        if st.button("Fetch"):
-            ids_list = [x.strip() for x in ids_text.split(",") if x.strip()]
-            if ids_list:
+        use_raw = "Raw" in view_mode
+
+        if st.button("Fetch reports", key="fetch_faers"):
+            ids_list = [x.strip() for x in ids_text.replace(",", "\n").split() if x.strip()]
+            if not ids_list:
+                st.warning("Enter at least one report ID.")
+            else:
                 try:
-                    docs = mongo_queries.get_faers_reports_by_ids(ids_list, raw=False)
-                    st.write(f"Found {len(docs)} of {len(ids_list)} reports.")
+                    docs = _mq.get_faers_reports_by_ids(ids_list, raw=use_raw)
+                    st.caption(f"Found **{len(docs)}** of {len(ids_list)} requested reports.")
                     if docs:
                         rows = []
                         for d in docs:
-                            patient = d.get("patient", {}) or {}
-                            drugs = patient.get("drug") or []
-                            drug_names = [(x.get("medicinalproduct") or "").lower() for x in drugs]
-                            reactions = patient.get("reaction") or []
-                            rx_names = [(x.get("reactionmeddrapt") or "").lower() for x in reactions]
+                            if use_raw:
+                                patient = d.get("patient", {}) or {}
+                                drugs_list = patient.get("drug") or []
+                                drug_names = [(x.get("medicinalproduct") or "").title() for x in drugs_list]
+                                reactions_list = patient.get("reaction") or []
+                                rx_names = [(x.get("reactionmeddrapt") or "").title() for x in reactions_list]
+                                report_id = d.get("safetyreportid") or str(d.get("_id", ""))
+                                receive_date = str(d.get("receivedate", ""))[:8]
+                            else:
+                                drug_names = [(x or "").title() for x in (d.get("drugs") or [])]
+                                rx_names = [(x or "").title() for x in (d.get("reactions") or [])]
+                                report_id = d.get("faers_id") or str(d.get("_id", ""))
+                                receive_date = str(d.get("receivedate", ""))[:8]
 
                             rows.append(
                                 {
-                                    "safetyreportid": d.get("safetyreportid"),
-                                    "receivedate": d.get("receivedate"),
-                                    "serious": d.get("serious") == "1",
-                                    "drug_count": len(drugs),
-                                    "drugs": ", ".join(drug_names[:3]) + ("…" if len(drug_names) > 3 else ""),
-                                    "reactions": ", ".join(rx_names[:3]) + ("…" if len(rx_names) > 3 else ""),
+                                    "Report ID": report_id,
+                                    "Date": f"{receive_date[:4]}-{receive_date[4:6]}-{receive_date[6:]}" if len(receive_date) == 8 else receive_date,
+                                    "Serious": "Yes" if str(d.get("serious", "")) == "1" else "No",
+                                    "Drugs": ", ".join(drug_names[:4]) + (" …" if len(drug_names) > 4 else ""),
+                                    "Reactions": ", ".join(rx_names[:4]) + (" …" if len(rx_names) > 4 else ""),
                                 }
                             )
 
                         st.subheader("FAERS reports (summary)")
                         st.dataframe(rows, use_container_width=True)
 
-                        with st.expander("Raw documents"):
+                        with st.expander("Full document detail"):
                             for d in docs:
+                                rid = d.get("safetyreportid") or d.get("faers_id") or str(d.get("_id", ""))
+                                st.markdown(f"**Report {rid}**")
                                 st.json(d)
-                    docs = mongo_queries.get_faers_reports_by_ids(ids_list)
-                    st.write(f"Found {len(docs)} reports.")
-                    for d in docs:
-                        st.json(d)
+                    else:
+                        st.info("No reports found for these IDs.")
                 except Exception as e:
                     st.error(str(e))
+        else:
+            st.info("Click **Fetch reports** to load the pre-filled report IDs above.")
+
+    # ── Audit log tab ─────────────────────────────────────────────────────
+    with tab_audit:
+        from db import mongo_queries as _mq  # local alias
+
+        st.markdown("Every full safety check can be logged here for **audit & reproducibility**.")
+
+        # Seed demo records if empty
+        try:
+            existing = _mq.list_safety_checks(limit=1)
+            if not existing:
+                from datetime import datetime, timezone, timedelta
+                import random
+
+                demo_runs = [
+                    ("Cyril Abbott", "Warfarin", "HIGH"),
+                    ("Lola Abernathy", "Ibuprofen", "MODERATE"),
+                    ("Jim Abbott", "Lipitor", "LOW"),
+                ]
+                now = datetime.now(timezone.utc)
+                for name, drug, risk in demo_runs:
+                    _mq.log_safety_check(
+                        {
+                            "inputs": {"patient_name": name, "proposed_drug": drug},
+                            "outputs": {"risk_level": risk},
+                            "notes": f"Demo record for {name} on {drug}.",
+                            "timestamp": (now - timedelta(days=random.randint(0, 14))).isoformat(),
+                        }
+                    )
+        except Exception:
+            pass
+
+        # Search / browse
+        search_name = st.text_input(
+            "Search by patient name", placeholder="e.g. Abbott", key="audit_search"
+        )
+        try:
+            if search_name.strip():
+                checks = _mq.search_safety_checks_by_patient(search_name, limit=50)
+                label = f'Results for "{search_name}" ({len(checks)} found)'
+            else:
+                checks = _mq.list_safety_checks(limit=20)
+                label = f"Recent runs ({len(checks)} shown)"
+        except Exception as e:
+            st.error(str(e))
+            checks = []
+            label = "Error loading records"
+
+        if checks:
+            st.subheader(label)
+            rows = []
+            for c in checks:
+                inp = c.get("inputs", {}) or {}
+                out = c.get("outputs", {}) or {}
+                rows.append(
+                    {
+                        "Patient": inp.get("patient_name") or inp.get("patient_id", "")[:12] or "—",
+                        "Proposed drug": inp.get("proposed_drug", "—"),
+                        "Risk": out.get("risk_level", "—"),
+                        "Interactions": out.get("interactions_found", "—"),
+                        "Date": str(c.get("timestamp", ""))[:10],
+                        "Notes": (c.get("notes") or "")[:70],
+                    }
+                )
+            st.dataframe(rows, use_container_width=True)
+        else:
+            if search_name.strip():
+                st.warning(f'No records found for "{search_name}".')
+            else:
+                st.info("No audit records yet. Log a run below.")
+
+        st.markdown("---")
+        st.subheader("Log a new safety check")
+
+        # Patient selection – use PG list if available
+        if HAS_PG:
+            try:
+                from db import pg_queries as _pg
+
+                patients = _pg.list_patients(limit=50, db_url=_pg_url())
+                p_labels = [
+                    f"{_clean_name(p.get('first_name',''))} {_clean_name(p.get('last_name',''))}"
+                    for p in patients
+                ]
+                idx = st.selectbox(
+                    "Patient", range(len(patients)), format_func=lambda i: p_labels[i], key="audit_patient"
+                )
+                selected_patient_name = p_labels[idx]
+                selected_patient_id = patients[idx]["id"]
+            except Exception:
+                selected_patient_name = st.text_input("Patient name", key="audit_patient_name")
+                selected_patient_id = None
+        else:
+            selected_patient_name = st.text_input("Patient name", key="audit_patient_name")
+            selected_patient_id = None
+
+        proposed_drug = st.text_input("Proposed drug", value="Warfarin", key="audit_drug")
+        risk_level = st.selectbox(
+            "Risk level", ["LOW", "MODERATE", "HIGH", "UNKNOWN"], key="audit_risk"
+        )
+        notes = st.text_area("Notes / summary", key="audit_notes", height=80)
+
+        if st.button("Log run", key="log_run_btn"):
+            run = {
+                "inputs": {
+                    "patient_name": selected_patient_name,
+                    "patient_id": selected_patient_id,
+                    "proposed_drug": proposed_drug or None,
+                },
+                "outputs": {"risk_level": risk_level},
+                "notes": notes or None,
+            }
+            try:
+                run_id = _mq.log_safety_check(run)
+                st.success(f"Logged successfully. Run ID: `{run_id}`")
+            except Exception as e:
+                st.error(str(e))
 
 
 # ── Page: Full Safety Check ──────────────────────────────────────────────
