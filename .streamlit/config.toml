@@ -1,0 +1,6 @@
+[theme]
+# Primary color for checkboxes, buttons, and other interactive elements (blue)
+primaryColor = "#1E88E5"
+# Neutral backgrounds so checkbox area has no blue block
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f0f2f6"

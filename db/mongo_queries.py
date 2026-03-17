@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import os
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, date, timezone
 from typing import Any
 
 try:
@@ -32,6 +32,25 @@ def _get_db(uri: str | None = None, db_name: str | None = None) -> Database:
         raise RuntimeError("pymongo is required. Install with: pip install pymongo")
     client = MongoClient(uri or DEFAULT_MONGO_URI)
     return client[db_name or DEFAULT_DB_NAME]
+
+
+# Helpers
+
+
+def _make_mongo_safe(obj: Any) -> Any:
+    """
+    Recursively convert values into types MongoDB can encode.
+
+    - datetime/date → ISO 8601 strings
+    - tuples       → lists
+    """
+    if isinstance(obj, dict):
+        return {k: _make_mongo_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_make_mongo_safe(v) for v in obj]
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+    return obj
 
 
 # Interface functions 
@@ -87,11 +106,12 @@ def log_safety_check(
         The assigned run_id (UUID string).
     """
     run_id = str(uuid.uuid4())
+    safe_run = _make_mongo_safe(run)
     doc = {
         "_id": run_id,
         "run_id": run_id,
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        **run,
+        **safe_run,
     }
     db = _get_db(mongo_uri, db_name)
     db[AUDIT_COLLECTION].insert_one(doc)

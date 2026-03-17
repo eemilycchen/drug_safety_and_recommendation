@@ -38,6 +38,8 @@ drug_safety_and_recommendation/
     demo.py                  # Streamlit demo: experience all databases
     # config.py              # Central DB config (to be implemented)
     # drug_safety_check.py   # Main orchestration & reporting (to be implemented)
+  .streamlit/
+    config.toml              # Theme: primaryColor (blue), neutral backgrounds
   docs/
     database_diagrams.md     # Mermaid diagrams for all four databases
     database_diagrams.html   # Browser-viewable version of the diagrams
@@ -126,7 +128,7 @@ Neo4j and MongoDB use defaults (`NEO4J_URI`, `NEO4J_USER`, `NEO4J_PASSWORD`, `MO
 ### 3. Run the Streamlit demo
 
 From the project root (with your venv activated and databases running):
-Export all of your commands:
+
 ```bash
 export PG_URL="postgresql://postgres:<your_password>@localhost:5432/drug_safety"
 export NEO4J_URI="neo4j://127.0.0.1:7687"
@@ -135,18 +137,29 @@ export NEO4J_PASSWORD="<your_password>"
 streamlit run app/demo.py
 ```
 
-```bash
-streamlit run app/demo.py
-```
+The app uses the theme in `.streamlit/config.toml` (blue primary color, neutral backgrounds). Restart the app after changing the config.
 
 The demo lets you:
 
 - **Patient data (PostgreSQL)** — List patients, view profile, active medications, medication history, and timeline.
 - **Drug knowledge (Neo4j)** — Check interactions (current meds vs proposed drug), side effects, interaction paths, shared side effects, safer alternatives, and graph statistics.
-- **Evidence & audit (MongoDB)** — Log safety-check runs and retrieve them by `run_id`; fetch FAERS reports by ID.
+- **Evidence & audit (MongoDB)** — Log safety-check runs and retrieve them by `run_id` or **search by patient name**; fetch FAERS reports by ID.
 - **Full safety check** — Enter a patient ID and proposed drug; see a combined report (profile + interactions + side effects) and optionally log the run to MongoDB.
 
 If a database is unreachable, the app shows a clear error and continues for other sections.
+
+### Streamlit app: features and UI
+
+- **Navigation** — Top tabs only (Full safety check, Patient data, Drug knowledge, FAERS + alternatives, Evidence & audit). The left sidebar is hidden. **Patients to list** (limit 5–100) is in the top-right corner and applies to the Patient data tab.
+- **Theming** — Hospital-style UI: blue gradient background, blue primary buttons, blue headings and subheadings, blue tab bar (no shadow). Main title is larger with extra top padding. Theme is configured in `.streamlit/config.toml` (primaryColor blue, neutral backgrounds); checkboxes (e.g. **Log to MongoDB**) use the primary blue with no blue block behind the label.
+- **Drug Knowledge graphs**
+  - **Preloaded examples** — All graph tabs (Polypharmacy, Interaction Network, Side Effects, Interaction Path, Shared Side Effects) use low-interaction drug examples (e.g. Mebendazole, Lindane) so graphs stay readable (roughly 5–7 nodes at depth 1). You can run `python -m db.neo4j_queries --few-interactions` to list other low-interaction drugs.
+  - **Polypharmacy cluster** — Shows the **full cluster** (all drugs and all edges in each cluster the proposed drug connects to), not only drugs directly connected to the proposed drug.
+  - **Interaction Path** — Displays both path text (e.g. Drug A → Drug B → Drug C) and a **left-to-right graph** (start drug = triangle, end drug = square, intermediates = dots).
+  - **Interaction Network / Path** — Center or start/end drug nodes use distinct shapes and colors (square, triangle); neighbor nodes use a neutral blue-grey.
+  - **Side Effects** — Only the graph is shown; the side-effects table was removed.
+- **Alternatives** — Alternatives show **actual drug names** (not drug-class labels). The app and Qdrant layer filter out known class names; when Qdrant returns only class names, the app falls back to DrugBank/NDC alternatives. Names are displayed in title case.
+- **MongoDB audit** — Each logged safety check stores **patient_name** (from PostgreSQL) as well as `patient_id`, so **Search by patient name** in Evidence & audit returns the correct runs.
 
 ---
 
@@ -275,15 +288,16 @@ This creates `SideEffect` nodes and `HAS_SIDE_EFFECT` relationships from drugs t
 The Part 2 interface lives in `db/neo4j_queries.py`.
 
 
-| Function                                               | Purpose                                                                       |
-| ------------------------------------------------------ | ----------------------------------------------------------------------------- |
-| `check_interactions(current_med_names, proposed_drug)` | Interactions between current meds and proposed drug (severity, description).  |
-| `get_side_effects(drug_name)`                          | Known side effects for a drug (name, frequency).                              |
-| `find_interaction_path(drug_a, drug_b)`                | Shortest path of interactions between two drugs.                              |
-| `find_shared_side_effects(drug_a, drug_b)`             | Side effects common to both drugs.                                            |
-| `find_safer_alternatives(drug_name, current_meds)`     | Alternatives that share indications but avoid interactions with current meds. |
-| `get_interaction_network(drug_name, depth)`            | Nodes and edges around a drug up to `depth` hops.                             |
-| `get_drug_stats()`                                     | Graph counts (drugs, interactions, side-effect links).                        |
+| Function                                                                 | Purpose                                                                       |
+| ------------------------------------------------------------------------ | ----------------------------------------------------------------------------- |
+| `check_interactions(current_med_names, proposed_drug)`                  | Interactions between current meds and proposed drug (severity, description).  |
+| `get_side_effects(drug_name)`                                           | Known side effects for a drug (name, frequency).                              |
+| `find_interaction_path(drug_a, drug_b)`                                 | Shortest path of interactions between two drugs.                              |
+| `find_shared_side_effects(drug_a, drug_b)`                               | Side effects common to both drugs.                                            |
+| `find_safer_alternatives(drug_name, current_meds)`                      | Alternatives that share indications but avoid interactions with current meds. |
+| `get_interaction_network(drug_name, depth)`                              | Nodes and edges around a drug up to `depth` hops.                             |
+| `get_drug_stats()`                                                       | Graph counts (drugs, interactions, side-effect links).                        |
+| `find_drugs_with_few_interactions(min_count, max_count, limit)`         | Drugs with few interactions (for readable graph preloads). CLI: `--few-interactions`. |
 
 
 ### 4. Run the Neo4j Queries Script
@@ -327,6 +341,8 @@ Part 3 provides **semantic search over adverse event reports and patient profile
 - **Demos/tests:**
   - `test_qdrant_queries.py` — sanity checks for FAERS similarity and drug–drug similarity.
   - `demo_qdrant.py` — interactive console demo: similar patients, safety signal analysis, BioLORD drug intelligence, and a full safety check walkthrough.
+
+**Connection:** Default `localhost:6333`. Override with `QDRANT_URL` (e.g. `http://localhost:6333` or `http://qdrant:6333` in Docker) or `QDRANT_HOST`/`QDRANT_PORT`.
 
 To run a minimal Qdrant pipeline:
 
@@ -387,8 +403,9 @@ The Part 4 interface lives in `db/mongo_queries.py`.
 | Function                                        | Purpose                                                                             |
 | ----------------------------------------------- | ----------------------------------------------------------------------------------- |
 | `get_faers_reports_by_ids(faers_ids, raw=True)` | Fetch FAERS reports by `safetyreportid`; used to attach evidence to Qdrant matches. |
-| `log_safety_check(run)`                         | Persist one safety-check run (inputs, outputs, timestamp); returns `run_id`.        |
+| `log_safety_check(run)`                         | Persist one safety-check run (inputs include `patient_id`, `patient_name`, `proposed_drug`, `current_meds`); returns `run_id`. |
 | `get_safety_check(run_id)`                      | Retrieve an audit record by `run_id`.                                               |
+| `search_safety_checks_by_patient(name)`         | Return audit records whose `inputs.patient_name` matches (case-insensitive).         |
 
 
 Use in Python:
