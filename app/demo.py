@@ -2329,7 +2329,8 @@ def main():
     # Top bar: title left, patients-to-list limit right
     header_left, header_right = st.columns([3, 1])
     with header_left:
-        st.markdown('<p class="main-title">Drug Safety & Recommendation</p>', unsafe_allow_html=True)
+        st.markdown('<p class="main-title">MediDB</p>', unsafe_allow_html=True)
+        st.markdown('<p>Drug Safety & Recommendation</p>', unsafe_allow_html=True)
         st.caption("Clinical view · PostgreSQL · Neo4j · Qdrant · MongoDB")
     with header_right:
         st.number_input("Patients to list", min_value=5, max_value=100, value=20, key="patient_list_limit")
