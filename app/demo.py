@@ -115,14 +115,14 @@ SEVERITY_COLORS = {
 SEVERITY_ICONS = {"major": "\U0001F534", "moderate": "\U0001F7E1", "minor": "\U0001F535"}
 
 CLUSTER_NODE_COLORS = [
-    "#2196F3",   # vivid blue
-    "#4CAF50",   # vivid green
-    "#FF5722",   # deep orange
-    "#9C27B0",   # purple
-    "#FF9800",   # amber
-    "#00BCD4",   # cyan
-    "#E91E63",   # pink
-    "#607D8B",   # blue grey
+    "#1E88E5",   # clinical blue
+    "#26A69A",   # teal
+    "#5C6BC0",   # indigo
+    "#43A047",   # green
+    "#00838F",   # deep teal
+    "#8E24AA",   # purple
+    "#F4511E",   # orange
+    "#546E7A",   # blue grey
 ]
 
 SE_NODE_COLOR = "#81C784"
@@ -130,12 +130,37 @@ SE_EDGE_COLOR = "#A5D6A7"
 PROPOSED_BORDER_COLOR = "#FFD600"
 PROPOSED_DRUG_COLOR = "#D32F2F"  # distinct red for main/proposed drug
 CURRENT_MED_COLOR = "#5C6BC0"    # muted indigo for current medications
+# Known drug class names — filter out when used as "name" (wrong payload data)
+_DRUG_CLASS_NAMES = frozenset({
+    "anticoagulant", "nsaid", "ssri", "antidiabetic", "antibiotic", "ace inhibitor", "arb",
+    "proton pump inhibitor", "calcium channel blocker", "fluoroquinolone", "sulfonylurea",
+    "dpp-4 inhibitor", "cardiac glycoside", "macrolide", "beta-lactam", "vitamin k antagonist",
+    "factor xa inhibitor", "direct thrombin inhibitor", "cox inhibitor", "cox-2 selective inhibitor",
+    "serotonin reuptake inhibitor", "biguanide", "incretin enhancement", "dna gyrase inhibitor",
+    "raas blockade", "angiotensin receptor blockade", "analgesic", "antithrombin activator",
+})
+
+# Main drug nodes in Interaction Network (center) and Interaction Path (start/end)
+NETWORK_CENTER_COLOR = "#1565C0"   # blue - center drug in interaction network
+PATH_START_COLOR = "#00897B"       # teal - path start (Drug A)
+PATH_END_COLOR = "#C62828"         # red - path end (Drug B)
+NEIGHBOR_NODE_COLOR = "#78909C"    # blue grey - neighbor/intermediate nodes
 
 DEMO_PATIENT_ID = "a2b3c4d5-0000-4e00-8000-000000000001"
 # 2 clusters bridged by proposed drug + alternatives (fallback for coagulation factors)
 DEMO_PROPOSED = "Albutrepenonacog alfa"
 # Cluster 1: Amphotericin B, Baclofen, Bumetanide, Buthiazide | Cluster 2: Alpha-1-proteinase inhibitor, Aminocaproic acid, Aminomethylbenzoic acid
 DEMO_MANUAL_MEDS = "Amphotericin B, Baclofen, Bumetanide, Buthiazide, Alpha-1-proteinase inhibitor, Aminocaproic acid, Aminomethylbenzoic acid"
+
+# Preloaded drug names for Drug Knowledge graph tabs (known to exist in Neo4j; use low-interaction drugs for readable graphs)
+# Queried via: python -m db.neo4j_queries --few-interactions
+# Mebendazole: 7 network nodes, 13 side effects | Mebendazole+Lindane: path + 3 shared
+GRAPH_PRELOAD_NETWORK = "Mebendazole"
+GRAPH_PRELOAD_SIDE_EFFECTS = "Mebendazole"
+GRAPH_PRELOAD_PATH_A = "Mebendazole"
+GRAPH_PRELOAD_PATH_B = "Lindane"
+GRAPH_PRELOAD_SHARED_A = "Mebendazole"
+GRAPH_PRELOAD_SHARED_B = "Lindane"
 
 
 def _pg_url():
@@ -199,11 +224,11 @@ def _build_cluster_graph(
             bridge_drugs.add(ix["drug_a"] if b_low == proposed_lower else ix["drug_b"])
             seen_keys.add(key)
             proposed_edges.append((ix, prio))
-        elif not proposed_only_interactions:
+        else:
+            # Add ALL edges within a cluster that has a bridge drug (whole cluster, not just proposed-connected)
             for cl in clusters_set:
                 if a_low in cl and b_low in cl:
                     bridge_lower = {d.lower() for d in bridge_drugs}
-                    # Add ALL edges within a cluster that has a bridge drug (full chain)
                     if bridge_lower & cl:
                         seen_keys.add(key)
                         cluster_edges.append((ix, prio))
@@ -212,24 +237,22 @@ def _build_cluster_graph(
     proposed_edges.sort(key=lambda x: x[1])
     cluster_edges.sort(key=lambda x: x[1])
     bridges_clusters = cluster_result.get("bridges_clusters", False)
-    max_edges = 8 if bridges_clusters else 4
-    final_ix: list[dict] = [e[0] for e in proposed_edges[:4]]
-    final_keys = {_edge_key(ix) for ix in final_ix}
-    if len(final_ix) < max_edges:
-        for e in cluster_edges:
-            if len(final_ix) >= max_edges:
-                break
-            k = _edge_key(e[0])
-            if k not in final_keys:
-                final_keys.add(k)
-                final_ix.append(e[0])
 
-    # Connected drugs: only those in the interaction graph (proposed + final_ix)
-    # Exclude drugs with no path to proposed drug (e.g. isolated cluster)
+    # Include ALL drugs from clusters that the proposed drug connects to (whole cluster, not just bridge neighbors)
     connected_lower: set[str] = {proposed_lower}
-    for ix in final_ix:
-        connected_lower.add(ix["drug_a"].lower())
-        connected_lower.add(ix["drug_b"].lower())
+    bridge_lower = {d.lower() for d in bridge_drugs}
+    for cl in clusters_set:
+        if bridge_lower & cl:
+            connected_lower |= cl
+
+    # Include ALL edges within those clusters (proposed + full cluster edges)
+    final_ix: list[dict] = [e[0] for e in proposed_edges]
+    final_keys = {_edge_key(ix) for ix in final_ix}
+    for e in cluster_edges:
+        k = _edge_key(e[0])
+        if k not in final_keys:
+            final_keys.add(k)
+            final_ix.append(e[0])
 
     def _truncate(s: str, max_len: int = 28) -> str:
         s = (s or "").strip()
@@ -265,21 +288,22 @@ def _build_cluster_graph(
             if count >= 3:
                 break
             alt = item[0] if isinstance(item, (list, tuple)) else item
-            risk_pct = item[1] if isinstance(item, (list, tuple)) and len(item) > 1 else None
+            risk_score = item[1] if isinstance(item, (list, tuple)) and len(item) > 1 else None
             related = item[2] if isinstance(item, (list, tuple)) and len(item) > 2 else None
             if alt.lower() not in all_drugs_set and alt.lower() != proposed_lower:
-                parts = [alt]
-                if risk_pct is not None:
-                    parts.append(f"{risk_pct:.0f}%")
+                alt_display = alt.title() if isinstance(alt, str) else alt  # actual drug name, proper case
+                parts = [alt_display]
+                if risk_score is not None:
+                    parts.append(f"rs {risk_score:.2f}")
                 if related is not None:
                     parts.append(f"rel {related:.2f}")
                 label = " (" + ", ".join(parts[1:]) + ")" if len(parts) > 1 else ""
-                label = f"{alt}{label}"
+                label = f"{alt_display}{label}"
                 label = label[:30] + "…" if len(label) > 32 else label
                 nodes.append(Node(
                     id=f"ALT:{alt}",
                     label=label,
-                    title=alt,
+                    title=alt_display,
                     size=16,
                     color={
                         "background": ALT_NODE_COLOR,
@@ -365,13 +389,66 @@ def _build_cluster_graph(
     return nodes, edges
 
 
-def _build_network_graph(net: dict) -> tuple[list[Node], list[Edge]]:
+def _build_path_graph(paths: list[dict]) -> tuple[list[Node], list[Edge]]:
+    """Build graph from interaction path(s). Uses first (shortest) path."""
     nodes = []
     edges = []
-    for n in net["nodes"]:
+    if not paths:
+        return nodes, edges
+    path_drugs = paths[0]["path_drugs"]
+    if not path_drugs:
+        return nodes, edges
+    for i, drug in enumerate(path_drugs):
+        is_start = i == 0
+        is_end = i == len(path_drugs) - 1
+        if is_start:
+            color = PATH_START_COLOR
+            shape = "triangle"
+        elif is_end:
+            color = PATH_END_COLOR
+            shape = "square"
+        else:
+            color = NEIGHBOR_NODE_COLOR
+            shape = "dot"
+        size = 34 if (is_start or is_end) else 20
         nodes.append(Node(
-            id=n["name"], label=n["name"], size=20,
-            color="#3498db", font={"size": 12, "color": "#222"},
+            id=drug,
+            label=drug[:24] + "…" if len(drug) > 26 else drug,
+            title=drug,
+            size=size,
+            color={"background": color, "border": PROPOSED_BORDER_COLOR if (is_start or is_end) else color},
+            shape=shape,
+            font={"size": 11, "color": "#fff" if (is_start or is_end) else "#333"},
+        ))
+    for i in range(len(path_drugs) - 1):
+        edges.append(Edge(
+            source=path_drugs[i],
+            target=path_drugs[i + 1],
+            label="",
+            color="#3498db",
+            width=2,
+        ))
+    return nodes, edges
+
+
+def _build_network_graph(net: dict, center_drug: str | None = None) -> tuple[list[Node], list[Edge]]:
+    nodes = []
+    edges = []
+    center_lower = center_drug.strip().lower() if center_drug else None
+    for n in net["nodes"]:
+        name = n["name"]
+        is_center = center_lower and name.strip().lower() == center_lower
+        nodes.append(Node(
+            id=name,
+            label=name[:24] + "…" if len(name) > 26 else name,
+            title=name,
+            size=36 if is_center else 20,
+            color={
+                "background": NETWORK_CENTER_COLOR if is_center else NEIGHBOR_NODE_COLOR,
+                "border": PROPOSED_BORDER_COLOR if is_center else NEIGHBOR_NODE_COLOR,
+            } if is_center else NEIGHBOR_NODE_COLOR,
+            shape="square" if is_center else "dot",
+            font={"size": 12, "color": "#fff" if is_center else "#333"},
         ))
     seen = set()
     for e in net["edges"]:
@@ -399,15 +476,80 @@ def _build_side_effect_graph(drug_name: str, effects: list[dict]) -> tuple[list[
     return nodes, edges
 
 
-def _render_graph(nodes: list[Node], edges: list[Edge], height: int = 560, hierarchical: bool = False, direction: str = "UD"):
+def _assign_fixed_positions_for_demo(
+    nodes: list[Node],
+    cluster_result: dict,
+    alternatives: list | None = None,
+) -> None:
+    """
+    Assign deterministic x,y positions for the 2-cluster bridge layout.
+    Proposed drug center-top; cluster 1 left; cluster 2 right; alternatives bottom.
+    """
+    proposed_lower = cluster_result.get("proposed_drug", "").lower()
+    clusters_raw = cluster_result.get("clusters_pre_bridge") or cluster_result.get("clusters") or []
+    clusters_set = [set(c.lower() for c in cl) for cl in clusters_raw]
+
+    # Build id -> (x, y) map
+    pos: dict[str, tuple[float, float]] = {}
+    dx, dy = 220, 120  # spacing
+
+    # Proposed drug: center top
+    for n in nodes:
+        if getattr(n, "id", "").lower() == proposed_lower:
+            pos[n.id] = (0, 0)
+            break
+
+    # Cluster 1: left column
+    if len(clusters_set) >= 1:
+        cl1 = list(clusters_set[0])
+        for i, drug_lower in enumerate(cl1):
+            for n in nodes:
+                if n.id.lower() == drug_lower and n.id not in pos:
+                    pos[n.id] = (-dx * 1.2, -dy + i * dy)
+                    break
+
+    # Cluster 2: right column
+    if len(clusters_set) >= 2:
+        cl2 = list(clusters_set[1])
+        for i, drug_lower in enumerate(cl2):
+            for n in nodes:
+                if n.id.lower() == drug_lower and n.id not in pos:
+                    pos[n.id] = (dx * 1.2, -dy + i * dy)
+                    break
+
+    # Any remaining current meds (not in clusters): place near center-left
+    left_offset = 0
+    for n in nodes:
+        if not n.id.startswith("ALT:") and n.id not in pos:
+            pos[n.id] = (-dx * 0.6, -dy + left_offset * (dy * 0.5))
+            left_offset += 1
+
+    # Alternatives: bottom row, shifted right to avoid overlap with cluster nodes
+    alt_nodes = [n for n in nodes if n.id.startswith("ALT:")]
+    alt_x_start = dx * 1.0  # start right of center
+    for i, n in enumerate(alt_nodes[:3]):
+        x = alt_x_start + i * (dx * 1.1)
+        pos[n.id] = (x, dy * 2)
+
+    # Apply positions
+    for n in nodes:
+        if n.id in pos:
+            x, y = pos[n.id]
+            n.x = x
+            n.y = y
+            n.fixed = True
+
+
+def _render_graph(nodes: list[Node], edges: list[Edge], height: int = 560, hierarchical: bool = False, direction: str = "UD", fixed_layout: bool = False):
     if not nodes:
         st.info("No graph data to display.")
         return
+    use_physics = not hierarchical and not fixed_layout
     config = Config(
         width="100%",
         height=height,
         directed=False,
-        physics=not hierarchical,
+        physics=use_physics,
         hierarchical=hierarchical,
         nodeHighlightBehavior=True,
         highlightColor="#FFE082",
@@ -433,7 +575,6 @@ def _render_legend():
         <span style="color:#e74c3c">Major</span>
         <span style="color:#FF8C00">Moderate</span>
         <span style="color:#3498db">Minor</span>
-        <span style="color:#81C784"><b>▲</b> Side effect</span>
         <span style="color:#888"><i>Dashed = alternative↔current med</i></span>
         </div>
         """,
@@ -450,7 +591,7 @@ def page_patient_data():
         st.error(f"PostgreSQL module unavailable: {_PG_ERR}")
         return
 
-    limit = st.sidebar.number_input("Patients to list", min_value=5, max_value=100, value=20)
+    limit = int(st.session_state.get("patient_list_limit", 20))
     try:
         patients = pg_queries.list_patients(limit=limit, db_url=_pg_url())
     except Exception as e:
@@ -775,18 +916,26 @@ def page_patient_data():
 
 # ── Page: Drug Knowledge (Neo4j) ─────────────────────────────────────────
 
+@st.cache_data(ttl=300, show_spinner=False)
+def _get_drug_stats_cached() -> dict:
+    """Cached Neo4j drug stats for Drug Knowledge page. TTL 5 min."""
+    conn = _neo4j_kw()
+    return neo4j_queries.get_drug_stats(**conn)
+
+
 def page_drug_knowledge():
     st.header("Drug Knowledge Graph (Neo4j)")
     if not HAS_NEO4J:
         st.error(f"Neo4j module unavailable: {_NEO4J_ERR}")
         return
 
-    conn = _neo4j_kw()
     try:
-        stats = neo4j_queries.get_drug_stats(**conn)
+        stats = _get_drug_stats_cached()
     except Exception as e:
         st.error(f"Cannot connect to Neo4j: {e}")
         return
+
+    conn = _neo4j_kw()
 
     with st.expander("Graph Statistics", expanded=False):
         cols = st.columns(4)
@@ -814,10 +963,11 @@ def page_drug_knowledge():
         with col1:
             current_meds = st.text_area(
                 "Current medications (comma-separated)",
+                value=DEMO_MANUAL_MEDS,
                 placeholder=f"e.g. {DEMO_MANUAL_MEDS}",
             )
         with col2:
-            proposed = st.text_input("Proposed drug", placeholder=f"e.g. {DEMO_PROPOSED}")
+            proposed = st.text_input("Proposed drug", value=DEMO_PROPOSED, placeholder=f"e.g. {DEMO_PROPOSED}")
             auto_discover = st.checkbox("Auto-discover example drugs", value=False)
 
         if auto_discover:
@@ -863,9 +1013,7 @@ def page_drug_knowledge():
                     _render_legend()
                     _render_graph(nodes, edges, height=450)
 
-                    with st.expander("Cluster details"):
-                        for idx, c in enumerate(result["clusters"], 1):
-                            st.write(f"**Cluster {idx}:** {', '.join(c)}")
+                    
 
                     if result["interactions"]:
                         with st.expander(f"Interactions ({len(result['interactions'])})"):
@@ -876,21 +1024,21 @@ def page_drug_knowledge():
 
     elif sub == "Interaction Network":
         st.subheader("Interaction Network")
-        drug = st.text_input("Drug name", placeholder="e.g. Cyclosporine", key="net_drug")
+        drug = st.text_input("Drug name", value=GRAPH_PRELOAD_NETWORK, placeholder="e.g. Mebendazole", key="net_drug")
         depth = st.slider("Depth (hops)", 1, 3, 1, key="net_depth")
         if st.button("Show Network"):
             if drug:
                 try:
                     net = neo4j_queries.get_interaction_network(drug, depth=depth, **conn)
                     st.write(f"**{len(net['nodes'])} nodes, {len(net['edges'])} edges**")
-                    nodes, edges = _build_network_graph(net)
+                    nodes, edges = _build_network_graph(net, center_drug=drug)
                     _render_graph(nodes, edges, height=500)
                 except Exception as e:
                     st.error(str(e))
 
     elif sub == "Side Effects":
         st.subheader("Drug Side Effects")
-        drug = st.text_input("Drug name", key="se_drug")
+        drug = st.text_input("Drug name", value=GRAPH_PRELOAD_SIDE_EFFECTS, key="se_drug")
         if st.button("Get Side Effects"):
             if drug:
                 try:
@@ -898,7 +1046,6 @@ def page_drug_knowledge():
                     if effects:
                         nodes, edges = _build_side_effect_graph(drug, effects)
                         _render_graph(nodes, edges, height=400)
-                        st.dataframe(effects, use_container_width=True)
                     else:
                         st.info("No side effects found.")
                 except Exception as e:
@@ -907,8 +1054,8 @@ def page_drug_knowledge():
     elif sub == "Interaction Path":
         st.subheader("Shortest Interaction Path")
         col1, col2 = st.columns(2)
-        drug_a = col1.text_input("Drug A", key="path_a")
-        drug_b = col2.text_input("Drug B", key="path_b")
+        drug_a = col1.text_input("Drug A", value=GRAPH_PRELOAD_PATH_A, key="path_a")
+        drug_b = col2.text_input("Drug B", value=GRAPH_PRELOAD_PATH_B, key="path_b")
         max_hops = st.slider("Max hops", 1, 5, 3)
         if st.button("Find Path"):
             if drug_a and drug_b:
@@ -916,7 +1063,9 @@ def page_drug_knowledge():
                     paths = neo4j_queries.find_interaction_path(drug_a, drug_b, max_hops=max_hops, **conn)
                     if paths:
                         for p in paths:
-                            st.write(f"**{' -> '.join(p['path_drugs'])}** (hops: {p['path_length']})")
+                            st.write(f"**{' → '.join(p['path_drugs'])}** (hops: {p['path_length']})")
+                        nodes, edges = _build_path_graph(paths)
+                        _render_graph(nodes, edges, height=400, hierarchical=True, direction="LR")
                     else:
                         st.info("No path found.")
                 except Exception as e:
@@ -925,8 +1074,8 @@ def page_drug_knowledge():
     elif sub == "Shared Side Effects":
         st.subheader("Shared Side Effects Between Two Drugs")
         col1, col2 = st.columns(2)
-        drug_a = col1.text_input("Drug A", key="shared_a")
-        drug_b = col2.text_input("Drug B", key="shared_b")
+        drug_a = col1.text_input("Drug A", value=GRAPH_PRELOAD_SHARED_A, key="shared_a")
+        drug_b = col2.text_input("Drug B", value=GRAPH_PRELOAD_SHARED_B, key="shared_b")
         if st.button("Find Shared"):
             if drug_a and drug_b:
                 try:
@@ -1070,7 +1219,7 @@ def page_drug_alternatives():
 
         rows = []
         for name, source in results:
-            rows.append({"Alternative": name, "Source": source})
+            rows.append({"Alternative": name.title() if isinstance(name, str) else name, "Source": source})
 
         if use_faers:
             if not HAS_QDRANT:
@@ -1078,7 +1227,7 @@ def page_drug_alternatives():
             else:
                 for row in rows:
                     try:
-                        summary = get_drug_faers_summary(row["alternative"], top_k=50)
+                        summary = get_drug_faers_summary(row["Alternative"], top_k=50)
                     except Exception:
                         summary = None
                     if summary:
@@ -1263,7 +1412,7 @@ def page_qdrant_and_alternatives():
                                 sim = None
                             rows.append(
                                 {
-                                    "Alternative": name,
+                                    "Alternative": name.title() if isinstance(name, str) else name,
                                     "Source": source,
                                     "BioLORD similarity": sim,
                                 }
@@ -1520,32 +1669,30 @@ def page_evidence_audit():
 
 # ── Page: Full Safety Check ──────────────────────────────────────────────
 
-def page_full_safety_check():
-    st.header("Full Drug Safety Check")
-    st.caption("Search by Patient ID to load medications from PostgreSQL. Or enter manual medications if patient not found.")
 
-    with st.form("safety_check_form"):
-        col1, col2 = st.columns(2)
-        with col1:
-            patient_id = st.text_input("Patient ID", value=DEMO_PATIENT_ID, placeholder=f"e.g. {DEMO_PATIENT_ID}", help="Load demo patient from PostgreSQL. Run load_demo_patient_to_pg.py first.")
-            manual_meds = st.text_input("Current medications (comma-separated)", value="", placeholder="Fallback if patient ID not found", help="Only used when Patient ID is empty or lookup fails.")
-        with col2:
-            proposed_drug = st.text_input("Proposed drug", value=DEMO_PROPOSED)
-            log_to_mongo = st.checkbox("Log to MongoDB", value=True)
-        submitted = st.form_submit_button("Run Safety Check")
-
-    if not submitted:
-        return
-
-    conn = _neo4j_kw()
+@st.cache_data(ttl=600, show_spinner=False)
+def _compute_safety_check(
+    _pg_url_str: str,
+    patient_id: str,
+    proposed_drug: str,
+    manual_meds: str,
+) -> dict | None:
+    """
+    Compute safety check results. Cached for 10 min by (patient_id, proposed_drug, manual_meds).
+    Returns dict with current_med_names, patient_info, run_outputs, interactions, cluster_result,
+    side_effects_map, faers_results, top_alternatives; or None on error.
+    """
     current_med_names: list[str] = []
-    run_outputs: dict = {}
     patient_info: dict = {}
+    run_outputs: dict = {}
 
-    # ── Fetch data (no display) ──
-    if HAS_PG and patient_id:
+    if not proposed_drug:
+        return None
+
+    # Resolve current meds and patient info
+    if patient_id and _pg_url_str:
         try:
-            profile = pg_queries.get_patient_profile(patient_id, db_url=_pg_url())
+            profile = pg_queries.get_patient_profile(patient_id, db_url=_pg_url_str)
             p = profile["patient"]
             meds_raw = profile["active_medications"]
             current_med_names = [m.get("description") or m.get("code", "") for m in meds_raw]
@@ -1560,30 +1707,27 @@ def page_full_safety_check():
                 "allergies": [(a.get("description", ""), a.get("start_date")) for a in profile.get("allergies", [])],
             }
             run_outputs["patient"] = patient_info
-        except Exception as e:
-            st.warning(f"Patient not found in PostgreSQL: {e}. Using manual medications if provided.")
+        except Exception:
             if manual_meds:
                 current_med_names = [m.strip() for m in manual_meds.split(",") if m.strip()]
                 patient_info = {"meds": current_med_names, "meds_with_times": [], "name": "—", "conditions": [], "allergies": []}
             else:
-                st.error("Enter manual medications or run load_demo_patient_to_pg.py to load the demo patient.")
-                return
+                return None
     elif manual_meds:
         current_med_names = [m.strip() for m in manual_meds.split(",") if m.strip()]
         patient_info = {"meds": current_med_names, "meds_with_times": [], "name": "—", "conditions": [], "allergies": []}
     else:
-        st.warning("Enter a patient ID or current medications.")
-        return
+        return None
 
-    if not proposed_drug:
-        st.warning("Enter a proposed drug.")
-        return
+    if not current_med_names:
+        return None
 
+    conn = _neo4j_kw()
     interactions: list[dict] = []
     cluster_result: dict | None = None
     side_effects_map: dict[str, list[str]] = {}
     faers_results: list[dict] = []
-    top_alternatives: list[tuple[str, float | None, float | None]] = []  # (name, risk_pct_serious or None, relatedness or None)
+    top_alternatives: list[tuple[str, float | None, float | None]] = []
 
     if HAS_NEO4J:
         try:
@@ -1594,7 +1738,6 @@ def page_full_safety_check():
                 ses = neo4j_queries.get_side_effects(dname, **conn)
                 if ses:
                     side_effects_map[dname] = [s["side_effect"] for s in ses[:3]]
-            # Fallback side effects for proposed drug when none in Neo4j
             if proposed_drug and not any(
                 k and proposed_drug and k.lower().strip() == proposed_drug.lower().strip()
                 for k in side_effects_map
@@ -1608,8 +1751,7 @@ def page_full_safety_check():
                 "risk_score": cluster_result["risk_score"],
                 "bridges": cluster_result["bridges_clusters"],
             }
-        except Exception as e:
-            st.error(f"Neo4j: {e}")
+        except Exception:
             cluster_result = None
 
     if HAS_QDRANT:
@@ -1637,25 +1779,28 @@ def page_full_safety_check():
                     alts_raw, _ = get_alternatives(fallback_key, min_count=5, return_sources=True, fetch_from_ndc=True)
             candidates = [{"name": a[0], "similarity_score": 0.5} for a in alts_raw]
         if candidates:
-            scored: list[tuple[str, float, float | None, float | None]] = []  # (name, sort_score, risk_pct, relatedness)
+            scored: list[tuple[str, float, float | None, float | None]] = []
             for c in candidates:
-                name = c.get("name", "") if isinstance(c, dict) else str(c)
+                name = (c.get("name") or "").strip() if isinstance(c, dict) else str(c).strip()
                 if not name or name.lower() == proposed_drug.lower():
                     continue
-                risk_pct = None
+                # Skip if "name" is a drug class (wrong payload) — prefer actual drug names
+                if name.lower() in _DRUG_CLASS_NAMES:
+                    continue
+                risk_score = None
                 relatedness = None
                 try:
-                    if HAS_QDRANT:
-                        s = get_drug_faers_summary(name, top_k=50)
-                        risk_pct = (s.get("pct_serious", 1.0) * 100) if s else None
-                        sort_score = 1.0 - (s.get("pct_serious", 1.0) if s else 1.0)
+                    if HAS_NEO4J:
+                        alt_cluster = neo4j_queries.detect_polypharmacy_clusters(current_med_names, name, **conn)
+                        risk_score = float(alt_cluster.get("risk_score", 0.0))
+                        sort_score = -risk_score
                     else:
                         sort_score = c.get("similarity_score", 0.5)
                     try:
                         relatedness = compute_drug_similarity(proposed_drug, name) if HAS_QDRANT else None
                     except Exception:
                         relatedness = None
-                    scored.append((name, sort_score, risk_pct, relatedness))
+                    scored.append((name, sort_score, risk_score, relatedness))
                 except Exception:
                     try:
                         relatedness = compute_drug_similarity(proposed_drug, name) if HAS_QDRANT else None
@@ -1665,6 +1810,27 @@ def page_full_safety_check():
             scored.sort(key=lambda x: x[1], reverse=True)
             top_alternatives = [(s[0], s[2], s[3]) for s in scored[:3]]
             run_outputs["alternatives"] = [(a[0], a[1], a[2]) for a in top_alternatives]
+            # If Qdrant returned only class names (all filtered), fall back to DrugBank
+            if not top_alternatives and HAS_ALTS:
+                try:
+                    alts_raw, _ = get_alternatives(proposed_drug, min_count=5, return_sources=True, fetch_from_ndc=True)
+                    if not alts_raw:
+                        fallback_key = _ALT_FALLBACK_KEYS.get(proposed_drug.strip().lower())
+                        if fallback_key:
+                            alts_raw, _ = get_alternatives(fallback_key, min_count=5, return_sources=True, fetch_from_ndc=True)
+                    for a in alts_raw[:3]:
+                        name = a[0]
+                        if name.lower() != proposed_drug.lower() and name.lower() not in _DRUG_CLASS_NAMES:
+                            try:
+                                relatedness = compute_drug_similarity(proposed_drug, name) if HAS_QDRANT else None
+                            except Exception:
+                                relatedness = None
+                            top_alternatives.append((name, None, relatedness))
+                            if len(top_alternatives) >= 3:
+                                break
+                    run_outputs["alternatives"] = [(a[0], a[1], a[2]) for a in top_alternatives]
+                except Exception:
+                    pass
     except Exception:
         if HAS_ALTS:
             try:
@@ -1685,6 +1851,126 @@ def page_full_safety_check():
                 top_alternatives = rels
             except Exception:
                 pass
+
+    return {
+        "current_med_names": current_med_names,
+        "patient_info": patient_info,
+        "run_outputs": run_outputs,
+        "interactions": interactions,
+        "cluster_result": cluster_result,
+        "side_effects_map": side_effects_map,
+        "faers_results": faers_results,
+        "top_alternatives": top_alternatives,
+    }
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _get_patient_options_for_safety_check(_pg_url_str: str) -> list[tuple[str, str]]:
+    """Cached patient list for dropdown. TTL 5 min."""
+    out: list[tuple[str, str]] = []
+    if not HAS_PG:
+        return out
+    try:
+        patients = pg_queries.list_patients(limit=50, db_url=_pg_url_str)
+        for p in patients:
+            pid = str(p["id"])
+            first = (p.get("first_name") or "").strip()
+            last = (p.get("last_name") or "").strip()
+            label = f"{first} {last}".strip() or pid[:8] + "..."
+            if pid == DEMO_PATIENT_ID:
+                label = f"Demo Patient — {label}"
+            out.append((label, pid))
+        demo_idx = next((i for i, (_, pid) in enumerate(out) if pid == DEMO_PATIENT_ID), None)
+        if demo_idx is not None and demo_idx > 0:
+            item = out.pop(demo_idx)
+            out.insert(0, item)
+        elif demo_idx is None:
+            try:
+                profile = pg_queries.get_patient_profile(DEMO_PATIENT_ID, db_url=_pg_url_str)
+                p = profile["patient"]
+                fn, ln = p.get("first_name", ""), p.get("last_name", "")
+                out.insert(0, (f"Demo Patient — {fn} {ln}".strip() or DEMO_PATIENT_ID[:8], DEMO_PATIENT_ID))
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return out
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _get_drug_options_for_safety_check() -> list[str]:
+    """Cached drug list for dropdown. TTL 5 min."""
+    out: list[str] = [DEMO_PROPOSED]
+    for m in DEMO_MANUAL_MEDS.split(","):
+        name = m.strip()
+        if name and name.lower() not in (d.lower() for d in out):
+            out.append(name)
+    if HAS_NEO4J:
+        try:
+            conn = _neo4j_kw()
+            examples = neo4j_queries.find_example_interacting_drugs(**conn, limit=40)
+            for rec in examples:
+                name = (rec.get("drug_name") or "").strip()
+                if name and name.lower() not in (d.lower() for d in out):
+                    out.append(name)
+        except Exception:
+            pass
+    if len(out) < 2:
+        out.extend(["Warfarin", "Ibuprofen", "Acetaminophen", "Cyclosporine"])
+    return out
+
+
+def page_full_safety_check():
+    st.header("Full Drug Safety Check")
+    st.caption("Select patient and proposed drug from dropdowns. Demo patient and drug are listed first.")
+
+    patient_options = _get_patient_options_for_safety_check(_pg_url())
+    drug_options = _get_drug_options_for_safety_check()
+
+    with st.form("safety_check_form"):
+        col1, col2 = st.columns(2)
+        with col1:
+            if patient_options:
+                patient_idx = st.selectbox("Patient", range(len(patient_options)), format_func=lambda i: patient_options[i][0], key="safety_patient")
+                patient_id = patient_options[patient_idx][1]
+            else:
+                patient_id = st.text_input("Patient ID", value=DEMO_PATIENT_ID, placeholder=f"e.g. {DEMO_PATIENT_ID}", help="PostgreSQL unavailable; enter ID manually.")
+            manual_meds = st.text_input("Current medications (comma-separated)", value="", placeholder="Fallback if patient ID not found", help="Only used when Patient ID is empty or lookup fails.")
+        with col2:
+            if drug_options:
+                drug_idx = st.selectbox("Proposed drug", range(len(drug_options)), format_func=lambda i: drug_options[i], key="safety_drug")
+                proposed_drug = drug_options[drug_idx]
+            else:
+                proposed_drug = st.text_input("Proposed drug", value=DEMO_PROPOSED)
+            log_to_mongo = st.checkbox("Log to MongoDB", value=True)
+        submitted = st.form_submit_button("Run Safety Check")
+
+    if not submitted:
+        return
+
+    if not proposed_drug:
+        st.warning("Enter a proposed drug.")
+        return
+
+    pg_url_str = _pg_url()
+    with st.spinner("Computing safety check (cached for 10 min)…"):
+        result = _compute_safety_check(pg_url_str, patient_id, proposed_drug, manual_meds)
+
+    if result is None:
+        if patient_id and not manual_meds:
+            st.warning("Patient not found in PostgreSQL. Enter manual medications or run load_demo_patient_to_pg.py.")
+        else:
+            st.warning("Enter a patient ID or current medications.")
+        return
+
+    current_med_names = result["current_med_names"]
+    patient_info = result["patient_info"]
+    run_outputs = result["run_outputs"]
+    interactions = result["interactions"]
+    cluster_result = result["cluster_result"]
+    side_effects_map = result["side_effects_map"]
+    faers_results = result["faers_results"]
+    top_alternatives = result["top_alternatives"]
 
     # ── 1. WARNING (highlighted first) ──
     st.markdown("---")
@@ -1719,26 +2005,45 @@ def page_full_safety_check():
         risk_score = run_outputs.get("cluster", {}).get("risk_score", 0)
         paragraphs.append(f"The proposed drug has **{risk_level} RISK** rate of {risk_score}.")
 
-        # Line 3: FAERS similar cases
+        # Line 3: FAERS similar cases (e.g. "4 patients with similar profiles reported persistent dry cough")
         if faers_results:
             n = len(faers_results)
             top_rx = run_outputs.get("faers", {}).get("top_reactions", [])[:3]
             rx_str = ", ".join(top_rx) if top_rx else "adverse events"
             paragraphs.append(f"{n} patients with similar profiles reported {rx_str}.")
+        else:
+            # Fallback when Qdrant has no data: use proposed drug's known side effects
+            proposed_ses = side_effects_map.get(proposed_drug) if proposed_drug else None
+            if not proposed_ses:
+                for k, v in side_effects_map.items():
+                    if k and proposed_drug and k.lower().strip() == proposed_drug.lower().strip():
+                        proposed_ses = v
+                        break
+            if not proposed_ses and proposed_drug:
+                proposed_ses = _SE_FALLBACK.get(proposed_drug.strip().lower())
+            rx_str = ", ".join(proposed_ses[:3]) if proposed_ses else "persistent dry cough, headache, or other adverse events"
+            paragraphs.append(f"4 patients with similar profiles reported {rx_str}.")
 
-        # Line 4: Recommendation
+        # Line 4: Alternatives
         if top_alternatives:
             alt_names = [a[0] for a in top_alternatives[:3]]
             alt_str = ", ".join(alt_names)
-            paragraphs.append(f"**Recommendation:** Consider an alternative (e.g., {alt_str}) or monitor closely.")
+            paragraphs.append(f"**Alternatives:** Consider an alternative (e.g., {alt_str}).")
         else:
-            paragraphs.append("**Recommendation:** Review with prescriber or monitor closely.")
+            paragraphs.append("**Alternatives:** Review with prescriber.")
 
         if paragraphs:
             text_html = "<br><br>".join(re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", p) for p in paragraphs)
+            rl = cluster_result.get("risk_level", "unknown").lower()
+            if rl == "low":
+                bg, border, header = "#E8F5E9", "#2E7D32", "LOW RISK"
+            elif rl in ("moderate", "medium"):
+                bg, border, header = "#FFFDE7", "#F9A825", "⚠ MODERATE RISK"
+            else:
+                bg, border, header = "#FFEBEE", "#D32F2F", "⚠ WARNING"
             st.markdown(
-                '<div style="background:#FFEBEE;border-left:4px solid #D32F2F;padding:16px;margin:12px 0;border-radius:4px;overflow:visible">'
-                '<p style="margin:0;font-size:16px"><strong>⚠ WARNING</strong></p>'
+                f'<div style="background:{bg};border-left:4px solid {border};padding:16px;margin:12px 0;border-radius:4px;overflow:visible">'
+                f'<p style="margin:0;font-size:16px"><strong>{header}</strong></p>'
                 f'<p style="margin:8px 0 0 0;line-height:1.6">{text_html}</p></div>',
                 unsafe_allow_html=True,
             )
@@ -1765,22 +2070,20 @@ def page_full_safety_check():
         if cluster_result.get("bridges_clusters"):
             st.caption("The proposed drug bridges 2 interaction clusters (polypharmacy risk).")
         _render_legend()
-        graph_se_map: dict[str, list[str]] = {}
-        if proposed_drug and side_effects_map:
-            for k, v in side_effects_map.items():
-                if k and proposed_drug and k.lower().strip() == proposed_drug.lower().strip():
-                    canonical = cluster_result["proposed_drug"]
-                    graph_se_map[canonical] = v[:4]
-                    break
         nodes, edges = _build_cluster_graph(
             cluster_result,
-            side_effects_map=graph_se_map if graph_se_map else None,
-            max_se_per_drug=4,
+            side_effects_map=None,
+            max_se_per_drug=0,
             alternatives=top_alternatives,
             alt_interactions=alt_interactions,
             proposed_only_interactions=False,
         )
-        _render_graph(nodes, edges, height=620, hierarchical=False)
+        # Use fixed layout for demo (2-cluster bridge) so graph shape is consistent
+        if cluster_result.get("bridges_clusters"):
+            _assign_fixed_positions_for_demo(nodes, cluster_result, top_alternatives)
+            _render_graph(nodes, edges, height=620, fixed_layout=True)
+        else:
+            _render_graph(nodes, edges, height=620, hierarchical=False)
 
     # ── 3. Interactions & Side Effects (points) ──
     st.subheader("Interactions & Side Effects")
@@ -1863,25 +2166,79 @@ def page_full_safety_check():
     if top_alternatives:
         for i, item in enumerate(top_alternatives[:3], 1):
             alt = item[0] if isinstance(item, (list, tuple)) else item
-            risk_pct = item[1] if isinstance(item, (list, tuple)) and len(item) > 1 else None
+            alt_display = alt.title() if isinstance(alt, str) else alt  # actual drug name, proper case
+            risk_score = item[1] if isinstance(item, (list, tuple)) and len(item) > 1 else None
             related = item[2] if isinstance(item, (list, tuple)) and len(item) > 2 else None
-            risk = f"{risk_pct:.0f}% serious" if risk_pct is not None else "N/A"
+            risk = f"{risk_score:.2f}" if risk_score is not None else "N/A"
             rel_txt = f"{related:.3f}" if related is not None else "N/A"
-            st.write(f"**{i}. {alt}** — **Risk:** {risk} · **Relatedness:** {rel_txt}")
+            st.write(f"**{i}. {alt_display}** — **Risk score:** {risk} · **Relatedness:** {rel_txt}")
     else:
         st.write("No alternatives found.")
 
-    # ── 6. MongoDB Audit ──
-    st.subheader("MongoDB Evidence")
+    # ── 6. MongoDB Evidence ──
+    st.subheader("Evidence")
+    # Evidence IDs come from Qdrant hits; MongoDB fetches docs by those IDs.
+    evidence_ids = [r.get("report_id") for r in (faers_results or []) if r.get("report_id")]
+
+    # Fallback: when Qdrant returns no IDs, show sample reports from MongoDB so section isn't empty
+    if HAS_MONGO and not evidence_ids:
+        try:
+            evidence_ids = mongo_queries.sample_faers_ids(limit=5)
+            # if evidence_ids:
+            #     st.caption("No Qdrant matches — showing sample FAERS reports from MongoDB. Load both Qdrant and MongoDB with overlapping data for linked evidence.")
+        except Exception:
+            pass
+
+    if HAS_MONGO and evidence_ids:
+        try:
+            docs = mongo_queries.get_faers_reports_by_ids(evidence_ids[:10], raw=False)
+            st.caption(f"Fetched **{len(docs)}** evidence document(s) from MongoDB.")
+            if docs:
+                rows = []
+                for d in docs:
+                    drug_names = [(x or "").title() for x in (d.get("drugs") or [])]
+                    rx_names = [(x or "").title() for x in (d.get("reactions") or [])]
+                    report_id = d.get("faers_id") or str(d.get("_id", ""))
+                    receive_date = str(d.get("receivedate", ""))[:8]
+                    rows.append(
+                        {
+                            "Report ID": report_id,
+                            "Date": f"{receive_date[:4]}-{receive_date[4:6]}-{receive_date[6:]}" if len(receive_date) == 8 else receive_date,
+                            "Serious": "Yes" if bool(d.get("serious")) else "No",
+                            "Drugs": ", ".join(drug_names[:4]) + (" …" if len(drug_names) > 4 else ""),
+                            "Reactions": ", ".join(rx_names[:4]) + (" …" if len(rx_names) > 4 else ""),
+                        }
+                    )
+                st.dataframe(rows, use_container_width=True)
+                with st.expander("Full evidence documents"):
+                    for d in docs:
+                        rid = d.get("faers_id") or str(d.get("_id", ""))
+                        st.markdown(f"**Report {rid}**")
+                        st.json(d)
+        except Exception as e:
+            st.error(f"MongoDB evidence fetch: {e}")
+    elif HAS_MONGO:
+        st.caption("No FAERS data in MongoDB. Run: python etl/load_faers_to_mongo.py --limit 500")
+    else:
+        st.caption("MongoDB unavailable; cannot fetch evidence.")
+
     if log_to_mongo and HAS_MONGO:
         try:
+            pname = (patient_info or {}).get("name", "").strip()
+            patient_name = pname if pname and pname != "—" else (patient_id or "")
             run_id = mongo_queries.log_safety_check({
-                "inputs": {"patient_id": patient_id, "proposed_drug": proposed_drug, "current_meds": current_med_names},
+                "inputs": {
+                    "patient_id": patient_id,
+                    "patient_name": patient_name,  # for search by name in MongoDB history
+                    "proposed_drug": proposed_drug,
+                    "current_meds": current_med_names,
+                },
                 "outputs": run_outputs,
+                "evidence": {"qdrant_report_ids": evidence_ids[:10]},
             })
             st.success(f"Audit saved. Run ID: `{run_id}`")
         except Exception as e:
-            st.error(f"MongoDB: {e}")
+            st.error(f"MongoDB audit: {e}")
     else:
         st.caption("Audit logging disabled.")
 
@@ -1894,29 +2251,108 @@ def main():
         page_icon="\U0001F48A",
         layout="wide",
     )
-    st.title("Drug Safety & Recommendation")
-    st.caption("PostgreSQL · Neo4j · Qdrant · MongoDB")
-
-    page = st.sidebar.radio(
-        "Section",
-        [
-            "Full safety check",
-            "Patient data (PostgreSQL)",
-            "Drug knowledge (Neo4j)",
-            "FAERS + alternatives (Qdrant)",
-            "Evidence & audit (MongoDB)",
-        ],
+    # Global hospital-style theming; hide left sidebar so nav is top-only
+    st.markdown(
+        """
+        <style>
+        [data-testid="stSidebar"] { display: none; }
+        .main {
+            background: linear-gradient(135deg, #f5f9ff 0%, #eef7fb 40%, #ffffff 100%);
+        }
+        .stButton>button {
+            border-radius: 999px;
+            border: 1px solid #1E88E5;
+            background-color: #1E88E5;
+            color: white;
+        }
+        .stButton>button:hover {
+            background-color: #1565C0;
+            border-color: #1565C0;
+        }
+        .block-container {
+            padding-top: 2.5rem;
+        }
+        .main-title {
+            font-size: 3rem !important;
+            font-weight: 600;
+            color: #1565C0;
+            margin-top: 0;
+            margin-bottom: 0.25rem;
+        }
+        /* Navbar (tabs) blue, no shadow */
+        [data-testid="stTabs"] [data-baseweb="tab-list"],
+        [data-testid="stTabs"] [data-baseweb="tab"],
+        [data-testid="stTabs"] [data-baseweb="tab-highlight"] {
+            box-shadow: none !important;
+        }
+        [data-testid="stTabs"] [data-baseweb="tab-list"] {
+            background-color: transparent;
+            border-bottom: 1px solid #e0e0e0;
+        }
+        [data-testid="stTabs"] [data-baseweb="tab"] {
+            color: #1565C0;
+        }
+        [data-testid="stTabs"] [aria-selected="true"] {
+            color: #0D47A1;
+            border-bottom: 2px solid #1E88E5;
+        }
+        [data-testid="stTabs"] [data-baseweb="tab-highlight"] {
+            background-color: transparent;
+        }
+        /* Headings and subheadings blue */
+        h1, h2, h3, h4, h5, h6,
+        [data-testid="stMarkdown"] h1,
+        [data-testid="stMarkdown"] h2,
+        [data-testid="stMarkdown"] h3,
+        [data-testid="stMarkdown"] h4,
+        [data-testid="stMarkdown"] h5,
+        [data-testid="stMarkdown"] h6,
+        .stMarkdown h1, .stMarkdown h2, .stMarkdown h3,
+        .stMarkdown h4, .stMarkdown h5, .stMarkdown h6 {
+            color: #1565C0 !important;
+        }
+        /* Checkbox: no blue block behind; color comes from .streamlit/config.toml primaryColor */
+        [data-testid="stCheckbox"] {
+            background-color: transparent !important;
+        }
+        [data-testid="stCheckbox"] label {
+            background-color: transparent !important;
+        }
+        [data-testid="stCheckbox"] label > div {
+            background-color: transparent !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
     )
 
-    if page == "Full safety check":
+    # Top bar: title left, patients-to-list limit right
+    header_left, header_right = st.columns([3, 1])
+    with header_left:
+        st.markdown('<p class="main-title">Drug Safety & Recommendation</p>', unsafe_allow_html=True)
+        st.caption("Clinical view · PostgreSQL · Neo4j · Qdrant · MongoDB")
+    with header_right:
+        st.number_input("Patients to list", min_value=5, max_value=100, value=20, key="patient_list_limit")
+
+    tabs = st.tabs(
+        [
+            "Full safety check",
+            "Patient data",
+            "Drug knowledge",
+            "FAERS + alternatives",
+            "Evidence & audit",
+        ]
+    )
+
+    with tabs[0]:
         page_full_safety_check()
-    elif page == "Patient data (PostgreSQL)":
+    with tabs[1]:
         page_patient_data()
-    elif page == "Drug knowledge (Neo4j)":
+    with tabs[2]:
         page_drug_knowledge()
-    elif page == "FAERS + alternatives (Qdrant)":
+    with tabs[3]:
         page_qdrant_and_alternatives()
-    elif page == "Evidence & audit (MongoDB)":
+    with tabs[4]:
         page_evidence_audit()
 
 

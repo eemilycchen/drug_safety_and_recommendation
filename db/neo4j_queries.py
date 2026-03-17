@@ -430,6 +430,36 @@ def get_drug_stats(
 # 9. Discover drugs that have interactions (diagnostic)
 # ---------------------------------------------------------------------------
 
+def find_drugs_with_few_interactions(
+    min_count: int = 1,
+    max_count: int = 15,
+    limit: int = 20,
+    uri: str = "bolt://127.0.0.1:7687",
+    user: str = "neo4j",
+    password: str = "password",
+) -> list[dict]:
+    """Find drugs that have few interactions (for readable graph visualization)."""
+    driver = get_connection(uri, user, password)
+    try:
+        with driver.session() as session:
+            result = session.run(
+                """
+                MATCH (d:Drug)-[r:INTERACTS_WITH]-()
+                WITH d.name AS drug_name, count(r) AS interaction_count
+                WHERE interaction_count >= $min_count AND interaction_count <= $max_count
+                RETURN drug_name, interaction_count
+                ORDER BY interaction_count ASC
+                LIMIT $limit
+                """,
+                min_count=min_count,
+                max_count=max_count,
+                limit=limit,
+            )
+            return [dict(rec) for rec in result]
+    finally:
+        driver.close()
+
+
 def find_example_interacting_drugs(
     uri: str = "bolt://127.0.0.1:7687",
     user: str = "neo4j",
@@ -563,9 +593,29 @@ if __name__ == "__main__":
         help="List drugs with no unknown edges that satisfy polypharmacy (min 2 interactions)",
     )
     parser.add_argument("--known-severity-limit", type=int, default=50)
+    parser.add_argument(
+        "--few-interactions",
+        action="store_true",
+        help="List drugs with few interactions (for readable graph preload)",
+    )
+    parser.add_argument("--few-max", type=int, default=15, help="Max interaction count for --few-interactions")
+    parser.add_argument("--few-min", type=int, default=1, help="Min interaction count for --few-interactions")
     args = parser.parse_args()
 
     conn = {"uri": args.uri, "user": args.user, "password": args.password}
+
+    if args.few_interactions:
+        print("\n=== Drugs with few interactions (good for graph preload) ===\n")
+        rows = find_drugs_with_few_interactions(
+            min_count=args.few_min, max_count=args.few_max, **conn
+        )
+        for r in rows:
+            print(f"  {r['drug_name']}: {r['interaction_count']} interactions")
+        if rows:
+            print(f"\n  Suggested preload: {rows[0]['drug_name']}")
+        else:
+            print("  No drugs found. Try --few-max 30")
+        exit(0)
 
     if args.known_severity_polypharmacy:
         print("\n=== Drugs with known severity only (no unknown edges), polypharmacy ===\n")

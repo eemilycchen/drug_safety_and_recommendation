@@ -38,6 +38,7 @@ MODEL_NAME = "FremyCompany/BioLORD-2023"
 VECTOR_DIM = 768  
 QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
 QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
+QDRANT_URL = os.getenv("QDRANT_URL", "")  # e.g. http://localhost:6333 or http://qdrant:6333
 ADVERSE_EVENTS_COLLECTION = "adverse_events"
 PATIENT_PROFILES_COLLECTION = "patient_profiles"
 
@@ -56,6 +57,8 @@ def _get_client() -> QdrantClient:
     qdrant_path = os.getenv("QDRANT_PATH", "")
     if qdrant_path:
         return QdrantClient(path=qdrant_path)
+    if QDRANT_URL:
+        return QdrantClient(url=QDRANT_URL)
     return QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
 
 
@@ -185,8 +188,8 @@ def find_similar_adverse_events_multi_filter(
             query_filter=query_filter,
             limit=top_k,
         ).points
-    except Exception:
-        return []
+    except Exception as e:
+        raise RuntimeError(f"Qdrant query failed: {e}. Ensure Qdrant is running (e.g. docker run -p 6333:6333 qdrant/qdrant) and data is loaded (python etl/load_faers_to_qdrant.py --limit 500).") from e
 
     return [
         {
@@ -612,11 +615,24 @@ def find_similar_drugs(
     except Exception:
         return []
 
+    # Drug class names that should not be used as drug "name" (wrong payload data)
+    _DRUG_CLASS_NAMES = frozenset({
+        "anticoagulant", "nsaid", "ssri", "antidiabetic", "antibiotic", "ace inhibitor", "arb",
+        "proton pump inhibitor", "calcium channel blocker", "fluoroquinolone", "sulfonylurea",
+        "dpp-4 inhibitor", "cardiac glycoside", "macrolide", "beta-lactam", "vitamin k antagonist",
+        "factor xa inhibitor", "direct thrombin inhibitor", "cox inhibitor", "cox-2 selective inhibitor",
+        "serotonin reuptake inhibitor", "biguanide", "incretin enhancement", "dna gyrase inhibitor",
+        "raas blockade", "angiotensin receptor blockade", "analgesic", "antithrombin activator",
+    })
+
     output = []
     for hit in results:
         payload = hit.payload or {}
-        name    = payload.get("name", "")
+        name    = (payload.get("name") or "").strip()
 
+        # skip empty or drug class used as name (wrong payload)
+        if not name or name.lower() in _DRUG_CLASS_NAMES:
+            continue
         # skip the drug itself — Qdrant may return it as its own nearest neighbour
         if exclude_drug and name.lower() == exclude_drug.lower():
             continue
